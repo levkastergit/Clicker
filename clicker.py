@@ -16,7 +16,7 @@ from tkinter import messagebox, ttk
 
 import updater
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 user32 = ctypes.windll.user32
 

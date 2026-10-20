@@ -34,7 +34,11 @@ pyinstaller Автокликер.spec
 ```
 
 Готовый файл появится в `dist/Автокликер.exe`. Чтобы кнопка обновления работала
-в exe-версии, выложите файл в GitHub Releases с тегом вида `v1.1.0`.
+в exe-версии, выложите файл в GitHub Releases с тегом, совпадающим с `__version__`
+в `clicker.py` (например `v1.1.0`). Имя файла в релизе должно быть латиницей,
+например `Autoclicker.exe`: кириллические имена GitHub заменяет на `default.exe`.
+
+Готовые сборки: https://github.com/levkastergit/Clicker/releases
 
 ## Структура
 

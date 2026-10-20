@@ -237,7 +237,8 @@ def _update_frozen(current_version: str) -> UpdateResult:
         f'del "{new_exe}"',
         '(goto) 2>nul & del "%~f0"',
     ]
-    bat.write_text("\r\n".join(bat_lines) + "\r\n", encoding="utf-8")
+    # newline="\r\n": иначе Windows превратит "\n" в "\r\n" ещё раз и получится "\r\r\n".
+    bat.write_text("\n".join(bat_lines) + "\n", encoding="utf-8", newline="\r\n")
     return UpdateResult(
         True,
         f"Скачана версия {data.get('tag_name')}. Программа перезапустится для установки.",
