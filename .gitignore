@@ -1,0 +1,16 @@
+# Артефакты сборки PyInstaller
+build/
+dist/
+*.exe
+
+# Python
+__pycache__/
+*.pyc
+
+# Служебный файл обновления (режим без git)
+.update_sha
+
+# IDE / локальные настройки
+.claude/
+.vscode/
+.idea/
