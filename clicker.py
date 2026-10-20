@@ -4,283 +4,354 @@
 
 from __future__ import annotations
 
-import ctypes
 import random
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
-from ctypes import wintypes
+from tkinter import font as tkfont
 from tkinter import messagebox, ttk
 
 import updater
+import winapi
+from winapi import MOUSE_ACTIONS, KeySpec, user32
 
-__version__ = "1.1.1"
-
-user32 = ctypes.windll.user32
-
-# Явные сигнатуры WinAPI: без них ctypes передаёт HWND/LPARAM как 32-битный int,
-# что на 64-битной Windows может обрезать значения.
-WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
-user32.EnumWindows.restype = wintypes.BOOL
-user32.IsWindowVisible.argtypes = [wintypes.HWND]
-user32.IsWindowVisible.restype = wintypes.BOOL
-user32.IsWindow.argtypes = [wintypes.HWND]
-user32.IsWindow.restype = wintypes.BOOL
-user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
-user32.GetWindowTextLengthW.restype = ctypes.c_int
-user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-user32.GetWindowTextW.restype = ctypes.c_int
-user32.PostMessageW.argtypes = [
-    wintypes.HWND,
-    wintypes.UINT,
-    wintypes.WPARAM,
-    wintypes.LPARAM,
-]
-user32.PostMessageW.restype = wintypes.BOOL
-user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
-user32.MapVirtualKeyW.restype = wintypes.UINT
-
-WM_LBUTTONDOWN = 0x0201
-WM_LBUTTONUP = 0x0202
-WM_RBUTTONDOWN = 0x0204
-WM_RBUTTONUP = 0x0205
-WM_MBUTTONDOWN = 0x0207
-WM_MBUTTONUP = 0x0208
-WM_KEYDOWN = 0x0100
-WM_KEYUP = 0x0101
-
-MK_LBUTTON = 0x0001
-MK_RBUTTON = 0x0002
-MK_MBUTTON = 0x0010
-
-MOUSE_ACTIONS = {
-    "Левая кнопка мыши": (WM_LBUTTONDOWN, WM_LBUTTONUP, MK_LBUTTON),
-    "Правая кнопка мыши": (WM_RBUTTONDOWN, WM_RBUTTONUP, MK_RBUTTON),
-    "Средняя кнопка мыши": (WM_MBUTTONDOWN, WM_MBUTTONUP, MK_MBUTTON),
-}
-
-VK_MAP: dict[str, int] = {
-    "Пробел": 0x20,
-    "Enter": 0x0D,
-    "Escape": 0x1B,
-    "Tab": 0x09,
-    "Backspace": 0x08,
-}
-VK_MAP.update({f"F{i}": 0x6F + i for i in range(1, 13)})
-VK_MAP.update({ch: ord(ch) for ch in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"})
-KEY_CHOICES = list(VK_MAP.keys())
+__version__ = "1.2.0"
 
 # Пауза между нажатием и отпусканием кнопки/клавиши, сек.
 PRESS_DURATION = 0.02
+# Сколько подряд неудачных PostMessage считать потерей окна.
+MAX_POST_FAILURES = 5
+
+HINT_COLOR = "#6b6b6b"
+OK_COLOR = "#1a7f37"
+WARN_COLOR = "#b45309"
+ERR_COLOR = "#b91c1c"
 
 
-def enum_windows() -> list[tuple[int, str]]:
-    """Список видимых окон с непустым заголовком, отсортированный по названию."""
-    result: list[tuple[int, str]] = []
+class KeyCaptureDialog(tk.Toplevel):
+    """Окно «нажмите клавишу»: запоминает VK-код и символ в текущей раскладке."""
 
-    def callback(hwnd: int, _lparam: int) -> bool:
-        if not user32.IsWindowVisible(hwnd):
-            return True
-        length = user32.GetWindowTextLengthW(hwnd)
-        if length == 0:
-            return True
-        buf = ctypes.create_unicode_buffer(length + 1)
-        user32.GetWindowTextW(hwnd, buf, length + 1)
-        title = buf.value.strip()
-        if title:
-            result.append((hwnd, title))
-        return True
+    def __init__(self, parent: tk.Misc) -> None:
+        super().__init__(parent)
+        self.result: KeySpec | None = None
+        self.title("Захват клавиши")
+        self.resizable(False, False)
+        self.transient(parent)
 
-    user32.EnumWindows(WNDENUMPROC(callback), 0)
-    result.sort(key=lambda item: item[1].lower())
-    return result
+        body = ttk.Frame(self, padding=20)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(body, text="Нажмите нужную клавишу", style="Title.TLabel").pack()
+        ttk.Label(
+            body,
+            text="Переключите раскладку заранее: символ запоминается\n"
+            "в той раскладке, которая активна в момент нажатия.",
+            style="Hint.TLabel",
+            justify=tk.CENTER,
+        ).pack(pady=(6, 12))
+        self.preview_var = tk.StringVar(value="…")
+        ttk.Label(body, textvariable=self.preview_var, style="Big.TLabel").pack(pady=(0, 12))
+        ttk.Button(body, text="Отмена", command=self.destroy).pack()
 
+        self.bind("<KeyPress>", self._on_key)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.update_idletasks()
+        px = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        py = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{max(px, 0)}+{max(py, 0)}")
+        self.grab_set()
+        self.focus_force()
 
-def make_lparam(x: int, y: int) -> int:
-    return ((y & 0xFFFF) << 16) | (x & 0xFFFF)
+    def _on_key(self, event: tk.Event) -> str:
+        vk = int(event.keycode)
+        char = event.char if event.char and event.char.isprintable() else None
+        if char == " ":
+            name = "Пробел"
+        elif char:
+            name = char
+        else:
+            name = event.keysym
+        self.result = KeySpec(name, vk, char)
+        self.preview_var.set(self.result.label)
+        self.after(150, self.destroy)
+        return "break"
 
 
 class AutoClickerApp:
     def __init__(self) -> None:
+        winapi.enable_dpi_awareness()
         self.root = tk.Tk()
         self.root.title(f"Автокликер {__version__}")
         self.root.resizable(False, False)
-        self.root.minsize(520, 500)
 
         self._windows: list[tuple[int, str]] = []
         self._running = False
         self._updating = False
         self._worker: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._key: KeySpec | None = None
 
+        self._setup_style()
         self._build_ui()
+        # Ширина окна рассчитывается по самому широкому режиму (клавиша),
+        # чтобы окно не «прыгало» при переключении Мышь/Клавиша.
+        self.root.update_idletasks()
+        self.root.minsize(self.root.winfo_reqwidth(), 0)
+        self._on_action_type_change()
         self.refresh_windows()
+
+    # --------------------------------------------------------------- style
+    def _setup_style(self) -> None:
+        style = ttk.Style(self.root)
+        if "vista" in style.theme_names():
+            style.theme_use("vista")
+        else:
+            style.theme_use("clam")
+
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+            try:
+                tkfont.nametofont(name).configure(family="Segoe UI", size=10)
+            except tk.TclError:
+                pass
+
+        style.configure("TLabelframe", padding=(12, 8, 12, 12))
+        style.configure("TLabelframe.Label", font=("Segoe UI Semibold", 10))
+        style.configure("Title.TLabel", font=("Segoe UI Semibold", 12))
+        style.configure("Big.TLabel", font=("Segoe UI", 16))
+        style.configure("Hint.TLabel", foreground=HINT_COLOR, font=("Segoe UI", 9))
+        style.configure("Status.TLabel", font=("Segoe UI", 10))
+        style.configure("Version.TLabel", foreground=HINT_COLOR, font=("Segoe UI", 9))
+        style.configure("Start.TButton", font=("Segoe UI Semibold", 10), padding=(18, 6))
+        style.configure("Stop.TButton", font=("Segoe UI Semibold", 10), padding=(18, 6))
+        style.configure("TButton", padding=(10, 4))
+        style.configure("TEntry", padding=3)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
-        pad = {"padx": 10, "pady": 6}
-        hint_color = "#555"
-        frame = ttk.Frame(self.root, padding=12)
-        frame.pack(fill=tk.BOTH, expand=True)
+        outer = ttk.Frame(self.root, padding=(16, 14, 16, 10))
+        outer.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(frame, text="Окно:").grid(row=0, column=0, sticky=tk.W, **pad)
-        win_row = ttk.Frame(frame)
-        win_row.grid(row=0, column=1, columnspan=2, sticky=tk.EW, **pad)
+        self._build_window_section(outer)
+        self._build_action_section(outer)
+        self._build_params_section(outer)
+        self._build_controls(outer)
+        self._build_status_bar(outer)
+
+    def _build_window_section(self, parent: ttk.Frame) -> None:
+        box = ttk.LabelFrame(parent, text="Целевое окно")
+        box.pack(fill=tk.X, pady=(0, 10))
+
         self.window_var = tk.StringVar()
-        self.window_combo = ttk.Combobox(
-            win_row, textvariable=self.window_var, state="readonly", width=42
+        self.window_combo = ttk.Combobox(box, textvariable=self.window_var, state="readonly")
+        self.window_combo.grid(row=0, column=0, sticky=tk.EW)
+        self.window_combo.bind("<<ComboboxSelected>>", lambda _e: self._update_window_state())
+        ttk.Button(box, text="Обновить список", command=self.refresh_windows).grid(
+            row=0, column=1, padx=(8, 0)
         )
-        self.window_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(win_row, text="Обновить список", command=self.refresh_windows).pack(
-            side=tk.LEFT, padx=(8, 0)
-        )
+        self.window_state_var = tk.StringVar()
+        self.window_state_lbl = ttk.Label(box, textvariable=self.window_state_var, style="Hint.TLabel")
+        self.window_state_lbl.grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
+        box.columnconfigure(0, weight=1)
 
-        ttk.Label(frame, text="Тип действия:").grid(row=1, column=0, sticky=tk.W, **pad)
+    def _build_action_section(self, parent: ttk.Frame) -> None:
+        box = ttk.LabelFrame(parent, text="Действие")
+        box.pack(fill=tk.X, pady=(0, 10))
+
         self.action_type_var = tk.StringVar(value="mouse")
-        type_frame = ttk.Frame(frame)
-        type_frame.grid(row=1, column=1, sticky=tk.W, **pad)
+        type_row = ttk.Frame(box)
+        type_row.grid(row=0, column=0, sticky=tk.W)
         ttk.Radiobutton(
-            type_frame,
-            text="Мышь",
-            value="mouse",
-            variable=self.action_type_var,
-            command=self._on_action_type_change,
+            type_row, text="Клик мышью", value="mouse",
+            variable=self.action_type_var, command=self._on_action_type_change,
         ).pack(side=tk.LEFT)
         ttk.Radiobutton(
-            type_frame,
-            text="Клавиша",
-            value="key",
-            variable=self.action_type_var,
-            command=self._on_action_type_change,
-        ).pack(side=tk.LEFT, padx=(12, 0))
+            type_row, text="Нажатие клавиши", value="key",
+            variable=self.action_type_var, command=self._on_action_type_change,
+        ).pack(side=tk.LEFT, padx=(16, 0))
 
-        ttk.Label(frame, text="Кнопка / клавиша:").grid(row=2, column=0, sticky=tk.W, **pad)
-        self.target_var = tk.StringVar(value="Левая кнопка мыши")
-        self.target_combo = ttk.Combobox(
-            frame,
-            textvariable=self.target_var,
-            values=list(MOUSE_ACTIONS.keys()),
-            state="readonly",
-            width=28,
+        # --- мышь
+        self.mouse_frame = ttk.Frame(box)
+        self.mouse_frame.grid(row=1, column=0, sticky=tk.EW, pady=(8, 0))
+        ttk.Label(self.mouse_frame, text="Кнопка:").grid(row=0, column=0, sticky=tk.W)
+        self.mouse_var = tk.StringVar(value="Левая кнопка мыши")
+        ttk.Combobox(
+            self.mouse_frame, textvariable=self.mouse_var,
+            values=list(MOUSE_ACTIONS.keys()), state="readonly", width=24,
+        ).grid(row=0, column=1, sticky=tk.W, padx=(8, 0))
+
+        # --- клавиша
+        self.key_frame = ttk.Frame(box)
+        self.key_frame.grid(row=1, column=0, sticky=tk.EW, pady=(8, 0))
+
+        ttk.Label(self.key_frame, text="Группа:").grid(row=0, column=0, sticky=tk.W)
+        self.key_group_var = tk.StringVar(value=winapi.KEY_GROUP_NAMES[0])
+        group_combo = ttk.Combobox(
+            self.key_frame, textvariable=self.key_group_var,
+            values=winapi.KEY_GROUP_NAMES, state="readonly", width=22,
         )
-        self.target_combo.grid(row=2, column=1, sticky=tk.W, **pad)
+        group_combo.grid(row=0, column=1, sticky=tk.W, padx=(8, 0))
+        group_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_key_group_change())
 
-        ttk.Label(frame, text="Интервал (сек):").grid(row=3, column=0, sticky=tk.W, **pad)
-        interval_frame = ttk.Frame(frame)
-        interval_frame.grid(row=3, column=1, sticky=tk.W, **pad)
+        ttk.Label(self.key_frame, text="Клавиша:").grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
+        self.key_var = tk.StringVar()
+        self.key_combo = ttk.Combobox(self.key_frame, textvariable=self.key_var, state="readonly", width=22)
+        self.key_combo.grid(row=1, column=1, sticky=tk.W, padx=(8, 0), pady=(6, 0))
+        self.key_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_key_selected())
+        ttk.Button(self.key_frame, text="Нажать клавишу…", command=self._capture_key).grid(
+            row=1, column=2, sticky=tk.W, padx=(8, 0), pady=(6, 0)
+        )
+
+        ttk.Label(self.key_frame, text="Отправлять как:").grid(row=2, column=0, sticky=tk.W, pady=(6, 0))
+        self.key_mode_var = tk.StringVar(value="key")
+        mode_row = ttk.Frame(self.key_frame)
+        mode_row.grid(row=2, column=1, columnspan=2, sticky=tk.W, padx=(8, 0), pady=(6, 0))
+        ttk.Radiobutton(mode_row, text="Нажатие клавиши", value="key", variable=self.key_mode_var).pack(side=tk.LEFT)
+        ttk.Radiobutton(mode_row, text="Символ (WM_CHAR)", value="char", variable=self.key_mode_var).pack(
+            side=tk.LEFT, padx=(12, 0)
+        )
+
+        self.key_info_var = tk.StringVar()
+        ttk.Label(self.key_frame, textvariable=self.key_info_var, style="Hint.TLabel", wraplength=500).grid(
+            row=3, column=0, columnspan=3, sticky=tk.W, pady=(6, 0)
+        )
+        self._on_key_group_change()
+
+    def _build_params_section(self, parent: ttk.Frame) -> None:
+        box = ttk.LabelFrame(parent, text="Параметры")
+        box.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(box, text="Интервал, сек:").grid(row=0, column=0, sticky=tk.W)
+        row = ttk.Frame(box)
+        row.grid(row=0, column=1, sticky=tk.W, padx=(8, 0))
         self.interval_min_var = tk.StringVar(value="0.4")
         self.interval_max_var = tk.StringVar(value="0.6")
-        ttk.Label(interval_frame, text="от").pack(side=tk.LEFT)
-        ttk.Entry(interval_frame, textvariable=self.interval_min_var, width=6).pack(
-            side=tk.LEFT, padx=(4, 8)
-        )
-        ttk.Label(interval_frame, text="до").pack(side=tk.LEFT)
-        ttk.Entry(interval_frame, textvariable=self.interval_max_var, width=6).pack(
-            side=tk.LEFT, padx=(4, 0)
-        )
-        ttk.Label(
-            interval_frame,
-            text="  (случайная пауза в этом диапазоне)",
-            foreground=hint_color,
-        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(row, text="от").pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=self.interval_min_var, width=7).pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Label(row, text="до").pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=self.interval_max_var, width=7).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(row, text="случайная пауза в диапазоне", style="Hint.TLabel").pack(side=tk.LEFT, padx=(10, 0))
 
-        ttk.Label(frame, text="Позиция клика (X, Y):").grid(
-            row=4, column=0, sticky=tk.W, **pad
-        )
-        pos_frame = ttk.Frame(frame)
-        pos_frame.grid(row=4, column=1, sticky=tk.W, **pad)
+        ttk.Label(box, text="Позиция клика:").grid(row=1, column=0, sticky=tk.W, pady=(8, 0))
+        row = ttk.Frame(box)
+        row.grid(row=1, column=1, sticky=tk.W, padx=(8, 0), pady=(8, 0))
         self.click_x_var = tk.StringVar(value="50")
         self.click_y_var = tk.StringVar(value="50")
-        ttk.Entry(pos_frame, textvariable=self.click_x_var, width=6).pack(side=tk.LEFT)
-        ttk.Label(pos_frame, text=",").pack(side=tk.LEFT, padx=4)
-        ttk.Entry(pos_frame, textvariable=self.click_y_var, width=6).pack(side=tk.LEFT)
-        ttk.Label(
-            pos_frame,
-            text="  (относительно клиентской области окна)",
-            foreground=hint_color,
-        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(row, text="X").pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=self.click_x_var, width=7).pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Label(row, text="Y").pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=self.click_y_var, width=7).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(row, text="от левого верхнего угла окна", style="Hint.TLabel").pack(side=tk.LEFT, padx=(10, 0))
 
-        ttk.Label(frame, text="Разброс позиции (±):").grid(
-            row=5, column=0, sticky=tk.W, **pad
-        )
-        spread_frame = ttk.Frame(frame)
-        spread_frame.grid(row=5, column=1, sticky=tk.W, **pad)
+        ttk.Label(box, text="Разброс, ± пикс:").grid(row=2, column=0, sticky=tk.W, pady=(8, 0))
+        row = ttk.Frame(box)
+        row.grid(row=2, column=1, sticky=tk.W, padx=(8, 0), pady=(8, 0))
         self.spread_x_var = tk.StringVar(value="3")
         self.spread_y_var = tk.StringVar(value="3")
-        ttk.Label(spread_frame, text="X").pack(side=tk.LEFT)
-        ttk.Entry(spread_frame, textvariable=self.spread_x_var, width=5).pack(
-            side=tk.LEFT, padx=(4, 12)
-        )
-        ttk.Label(spread_frame, text="Y").pack(side=tk.LEFT)
-        ttk.Entry(spread_frame, textvariable=self.spread_y_var, width=5).pack(
-            side=tk.LEFT, padx=(4, 0)
-        )
-        ttk.Label(
-            spread_frame,
-            text="  пикс. (0 = без разброса)",
-            foreground=hint_color,
-        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(row, text="X").pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=self.spread_x_var, width=7).pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Label(row, text="Y").pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=self.spread_y_var, width=7).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(row, text="0 = точно в указанную точку", style="Hint.TLabel").pack(side=tk.LEFT, padx=(10, 0))
 
-        ttk.Label(frame, text="Количество (0 = бесконечно):").grid(
-            row=6, column=0, sticky=tk.W, **pad
-        )
+        ttk.Label(box, text="Количество:").grid(row=3, column=0, sticky=tk.W, pady=(8, 0))
+        row = ttk.Frame(box)
+        row.grid(row=3, column=1, sticky=tk.W, padx=(8, 0), pady=(8, 0))
         self.count_var = tk.StringVar(value="0")
-        ttk.Entry(frame, textvariable=self.count_var, width=10).grid(
-            row=6, column=1, sticky=tk.W, **pad
-        )
+        ttk.Entry(row, textvariable=self.count_var, width=7).pack(side=tk.LEFT)
+        ttk.Label(row, text="0 = бесконечно", style="Hint.TLabel").pack(side=tk.LEFT, padx=(10, 0))
 
-        btn_frame = ttk.Frame(frame)
-        btn_frame.grid(row=7, column=0, columnspan=3, pady=16)
-        self.start_btn = ttk.Button(btn_frame, text="Старт", command=self.start)
-        self.start_btn.pack(side=tk.LEFT, padx=6)
-        self.stop_btn = ttk.Button(
-            btn_frame, text="Стоп", command=self.stop, state=tk.DISABLED
-        )
-        self.stop_btn.pack(side=tk.LEFT, padx=6)
-        self.update_btn = ttk.Button(
-            btn_frame, text="Обновить программу", command=self.check_updates
-        )
-        self.update_btn.pack(side=tk.LEFT, padx=(18, 6))
+    def _build_controls(self, parent: ttk.Frame) -> None:
+        row = ttk.Frame(parent)
+        row.pack(fill=tk.X, pady=(4, 8))
+        self.start_btn = ttk.Button(row, text="▶  Старт", style="Start.TButton", command=self.start)
+        self.start_btn.pack(side=tk.LEFT)
+        self.stop_btn = ttk.Button(row, text="■  Стоп", style="Stop.TButton", command=self.stop, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.update_btn = ttk.Button(row, text="Обновить программу", command=self.check_updates)
+        self.update_btn.pack(side=tk.RIGHT)
 
+    def _build_status_bar(self, parent: ttk.Frame) -> None:
+        ttk.Separator(parent).pack(fill=tk.X)
+        bar = ttk.Frame(parent)
+        bar.pack(fill=tk.X, pady=(6, 0))
         self.status_var = tk.StringVar(value="Готов")
-        ttk.Label(frame, textvariable=self.status_var, foreground="#006400").grid(
-            row=8, column=0, columnspan=3, sticky=tk.W, padx=10, pady=(0, 8)
-        )
+        self.status_lbl = ttk.Label(bar, textvariable=self.status_var, style="Status.TLabel", foreground=OK_COLOR)
+        self.status_lbl.pack(side=tk.LEFT)
+        ttk.Label(bar, text=f"v{__version__}", style="Version.TLabel").pack(side=tk.RIGHT)
 
-        hint = (
-            "Подсказка: выберите окно, кнопку или клавишу. Интервал и позиция клика "
-            "случайны в указанных диапазонах. Для точного клика поставьте разброс 0. "
-            "Нажмите «Стоп» или закройте окно, чтобы остановить кликер. "
-            "«Обновить программу» скачивает новую версию с GitHub."
-        )
-        ttk.Label(frame, text=hint, wraplength=480, foreground="#444").grid(
-            row=9, column=0, columnspan=3, sticky=tk.W, padx=10
-        )
-
-        frame.columnconfigure(1, weight=1)
+    # ------------------------------------------------------------- helpers
+    def _set_status(self, text: str, color: str = OK_COLOR) -> None:
+        self.status_var.set(text)
+        self.status_lbl.configure(foreground=color)
 
     def _on_action_type_change(self) -> None:
         if self.action_type_var.get() == "mouse":
-            self.target_combo.configure(values=list(MOUSE_ACTIONS.keys()))
-            self.target_var.set("Левая кнопка мыши")
+            self.key_frame.grid_remove()
+            self.mouse_frame.grid()
         else:
-            self.target_combo.configure(values=KEY_CHOICES)
-            self.target_var.set("Пробел")
+            self.mouse_frame.grid_remove()
+            self.key_frame.grid()
+
+    def _on_key_group_change(self) -> None:
+        keys = winapi.KEY_GROUPS[self.key_group_var.get()]
+        self.key_combo.configure(values=[k.label for k in keys])
+        self.key_combo.current(0)
+        self._on_key_selected()
+
+    def _on_key_selected(self) -> None:
+        self._key = winapi.key_by_label(self.key_var.get())
+        self._refresh_key_info()
+
+    def _capture_key(self) -> None:
+        dialog = KeyCaptureDialog(self.root)
+        self.root.wait_window(dialog)
+        if dialog.result is not None:
+            self._key = dialog.result
+            self.key_var.set("")
+            self._refresh_key_info(captured=True)
+
+    def _refresh_key_info(self, captured: bool = False) -> None:
+        key = self._key
+        if key is None:
+            self.key_info_var.set("Клавиша не выбрана.")
+            return
+        source = "Захвачено с клавиатуры" if captured else "Выбрано"
+        char_info = f"символ «{key.char}»" if key.char and key.char.strip() else "без символа"
+        self.key_info_var.set(
+            f"{source}: {key.label}, {char_info}. "
+            "Режим «Нажатие клавиши» отправляет VK-код, и символ определяет раскладка целевого окна. "
+            "Режим «Символ» отправляет сам символ независимо от раскладки (подходит для текстовых полей)."
+        )
 
     def refresh_windows(self) -> None:
-        self._windows = enum_windows()
+        self._windows = winapi.enum_windows()
         titles = [title for _, title in self._windows]
         self.window_combo.configure(values=titles)
         if titles:
             self.window_combo.current(0)
-            self.status_var.set(f"Найдено окон: {len(titles)}")
+            self._set_status(f"Найдено окон: {len(titles)}")
         else:
             self.window_var.set("")
-            self.status_var.set("Окна не найдены")
+            self._set_status("Окна не найдены", WARN_COLOR)
+        self._update_window_state()
+
+    def _update_window_state(self) -> None:
+        hwnd = self._resolve_hwnd()
+        if hwnd is None:
+            self.window_state_var.set("")
+            return
+        if not user32.IsWindow(hwnd):
+            self.window_state_var.set("Окно больше не существует — обновите список.")
+            self.window_state_lbl.configure(foreground=ERR_COLOR)
+        elif user32.IsIconic(hwnd):
+            self.window_state_var.set(
+                "Окно свёрнуто. Многие программы не обрабатывают клики в свёрнутом окне."
+            )
+            self.window_state_lbl.configure(foreground=WARN_COLOR)
+        else:
+            self.window_state_var.set(f"Окно открыто, HWND 0x{hwnd:X}.")
+            self.window_state_lbl.configure(foreground=HINT_COLOR)
 
     def _resolve_hwnd(self) -> int | None:
         # Берём по индексу, а не по заголовку: у нескольких окон может быть
@@ -322,22 +393,33 @@ class AutoClickerApp:
         if hwnd is None:
             messagebox.showwarning("Окно", "Выберите окно из списка.")
             return
-
         if not user32.IsWindow(hwnd):
-            messagebox.showwarning(
-                "Окно", "Выбранное окно больше не существует. Обновите список."
-            )
+            messagebox.showwarning("Окно", "Выбранное окно больше не существует. Обновите список.")
             self.refresh_windows()
             return
+
+        if user32.IsIconic(hwnd):
+            answer = messagebox.askyesnocancel(
+                "Окно свёрнуто",
+                "Выбранное окно свёрнуто. Большинство программ и игр не обрабатывают "
+                "клики и клавиши, пока окно свёрнуто.\n\n"
+                "Да — развернуть окно и запустить\n"
+                "Нет — запустить как есть\n"
+                "Отмена — не запускать",
+            )
+            if answer is None:
+                return
+            if answer:
+                user32.ShowWindow(hwnd, winapi.SW_RESTORE)
+                time.sleep(0.3)
+            self._update_window_state()
 
         interval_min = self._parse_float(self.interval_min_var.get(), "Минимальный интервал")
         interval_max = self._parse_float(self.interval_max_var.get(), "Максимальный интервал")
         if interval_min is None or interval_max is None:
             return
         if interval_min > interval_max:
-            messagebox.showerror(
-                "Ошибка", "Минимальный интервал не может быть больше максимального."
-            )
+            messagebox.showerror("Ошибка", "Минимальный интервал не может быть больше максимального.")
             return
 
         max_count = self._parse_int(self.count_var.get(), "Количество")
@@ -345,12 +427,13 @@ class AutoClickerApp:
             return
 
         action_type = self.action_type_var.get()
-        target = self.target_var.get()
+        click_x = click_y = spread_x = spread_y = 0
+        mouse_target = self.mouse_var.get()
+        key: KeySpec | None = None
+        key_mode = self.key_mode_var.get()
 
-        click_x = click_y = 0
-        spread_x = spread_y = 0
         if action_type == "mouse":
-            if target not in MOUSE_ACTIONS:
+            if mouse_target not in MOUSE_ACTIONS:
                 messagebox.showwarning("Действие", "Выберите кнопку мыши.")
                 return
             click_x = self._parse_int(self.click_x_var.get(), "X")
@@ -359,30 +442,41 @@ class AutoClickerApp:
             spread_y = self._parse_int(self.spread_y_var.get(), "Разброс Y")
             if None in (click_x, click_y, spread_x, spread_y):
                 return
-        elif target not in VK_MAP:
-            messagebox.showwarning("Действие", "Выберите клавишу.")
-            return
+        else:
+            key = self._key
+            if key is None:
+                messagebox.showwarning("Действие", "Выберите клавишу или нажмите «Нажать клавишу…».")
+                return
+            if key_mode == "char" and not key.char:
+                messagebox.showwarning(
+                    "Действие",
+                    f"У клавиши {key.name} нет печатного символа. "
+                    "Выберите режим «Нажатие клавиши».",
+                )
+                return
 
         self._stop_event.clear()
         self._running = True
         self.start_btn.configure(state=tk.DISABLED)
         self.stop_btn.configure(state=tk.NORMAL)
         self.update_btn.configure(state=tk.DISABLED)
-        self.status_var.set("Работает...")
+        self._set_status("Работает…")
 
         self._worker = threading.Thread(
             target=self._click_loop,
-            args=(
-                hwnd,
-                interval_min,
-                interval_max,
-                max_count,
-                action_type,
-                target,
-                click_x,
-                click_y,
-                spread_x,
-                spread_y,
+            kwargs=dict(
+                hwnd=hwnd,
+                interval_min=interval_min,
+                interval_max=interval_max,
+                max_count=max_count,
+                action_type=action_type,
+                mouse_target=mouse_target,
+                key=key,
+                key_mode=key_mode,
+                click_x=click_x,
+                click_y=click_y,
+                spread_x=spread_x,
+                spread_y=spread_y,
             ),
             daemon=True,
         )
@@ -392,12 +486,10 @@ class AutoClickerApp:
         if not self._running:
             return
         self._stop_event.set()
-        self.status_var.set("Остановка...")
+        self._set_status("Остановка…", WARN_COLOR)
 
     @staticmethod
-    def _random_click_position(
-        x: int, y: int, spread_x: int, spread_y: int
-    ) -> tuple[int, int]:
+    def _random_click_position(x: int, y: int, spread_x: int, spread_y: int) -> tuple[int, int]:
         if spread_x > 0:
             x += random.randint(-spread_x, spread_x)
         if spread_y > 0:
@@ -411,67 +503,92 @@ class AutoClickerApp:
         interval_max: float,
         max_count: int,
         action_type: str,
-        target: str,
+        mouse_target: str,
+        key: KeySpec | None,
+        key_mode: str,
         click_x: int,
         click_y: int,
         spread_x: int,
         spread_y: int,
     ) -> None:
         performed = 0
-        window_closed = False
+        reason = ""
+        failures = 0
         try:
             while not self._stop_event.is_set():
                 if max_count > 0 and performed >= max_count:
                     break
                 if not user32.IsWindow(hwnd):
-                    window_closed = True
+                    reason = "Окно закрыто — кликер остановлен."
                     break
 
-                actual_x, actual_y = click_x, click_y
                 if action_type == "mouse":
-                    actual_x, actual_y = self._random_click_position(
-                        click_x, click_y, spread_x, spread_y
-                    )
+                    x, y = self._random_click_position(click_x, click_y, spread_x, spread_y)
+                    ok = self._send_mouse(hwnd, mouse_target, x, y)
+                else:
+                    assert key is not None
+                    ok = self._send_key(hwnd, key, key_mode)
 
-                self._perform_action(hwnd, action_type, target, actual_x, actual_y)
-                performed += 1
-                self.root.after(
-                    0, lambda n=performed: self.status_var.set(f"Выполнено действий: {n}")
-                )
+                if ok:
+                    failures = 0
+                    performed += 1
+                else:
+                    failures += 1
+                    if failures >= MAX_POST_FAILURES:
+                        reason = (
+                            f"Окно не принимает сообщения ({MAX_POST_FAILURES} ошибок подряд, "
+                            f"код {winapi.last_error()}). Кликер остановлен."
+                        )
+                        break
+
+                iconic = bool(user32.IsIconic(hwnd))
+                self.root.after(0, self._report_progress, performed, iconic)
 
                 pause = random.uniform(interval_min, interval_max)
                 if self._stop_event.wait(pause):
                     break
         finally:
-            self.root.after(0, self._on_worker_finished, performed, window_closed)
+            self.root.after(0, self._on_worker_finished, performed, reason)
 
     @staticmethod
-    def _perform_action(
-        hwnd: int, action_type: str, target: str, click_x: int, click_y: int
-    ) -> None:
-        if action_type == "mouse":
-            down_msg, up_msg, wparam_mk = MOUSE_ACTIONS[target]
-            lparam = make_lparam(click_x, click_y)
-            user32.PostMessageW(hwnd, down_msg, wparam_mk, lparam)
-            time.sleep(PRESS_DURATION)
-            user32.PostMessageW(hwnd, up_msg, 0, lparam)
-        else:
-            vk = VK_MAP[target]
-            scan = user32.MapVirtualKeyW(vk, 0)
-            lparam_down = 1 | (scan << 16)
-            lparam_up = lparam_down | (1 << 30) | (1 << 31)
-            user32.PostMessageW(hwnd, WM_KEYDOWN, vk, lparam_down)
-            time.sleep(PRESS_DURATION)
-            user32.PostMessageW(hwnd, WM_KEYUP, vk, lparam_up)
+    def _send_mouse(hwnd: int, target: str, x: int, y: int) -> bool:
+        down_msg, up_msg, wparam_mk = MOUSE_ACTIONS[target]
+        lparam = winapi.make_lparam(x, y)
+        ok = user32.PostMessageW(hwnd, down_msg, wparam_mk, lparam)
+        time.sleep(PRESS_DURATION)
+        ok2 = user32.PostMessageW(hwnd, up_msg, 0, lparam)
+        return bool(ok and ok2)
 
-    def _on_worker_finished(self, performed: int, window_closed: bool) -> None:
+    @staticmethod
+    def _send_key(hwnd: int, key: KeySpec, mode: str) -> bool:
+        lparam_down, lparam_up = winapi.key_lparams(key.vk)
+        if mode == "char" and key.char:
+            return bool(user32.PostMessageW(hwnd, winapi.WM_CHAR, ord(key.char), lparam_down))
+        ok = user32.PostMessageW(hwnd, winapi.WM_KEYDOWN, key.vk, lparam_down)
+        time.sleep(PRESS_DURATION)
+        ok2 = user32.PostMessageW(hwnd, winapi.WM_KEYUP, key.vk, lparam_up)
+        return bool(ok and ok2)
+
+    def _report_progress(self, performed: int, iconic: bool) -> None:
+        if not self._running:
+            return
+        if iconic:
+            self._set_status(
+                f"Выполнено действий: {performed}  ·  окно свёрнуто, клики могут не доходить",
+                WARN_COLOR,
+            )
+        else:
+            self._set_status(f"Выполнено действий: {performed}")
+
+    def _on_worker_finished(self, performed: int, reason: str) -> None:
         self._running = False
         self.start_btn.configure(state=tk.NORMAL)
         self.stop_btn.configure(state=tk.DISABLED)
         self.update_btn.configure(state=tk.NORMAL)
-        self.status_var.set(f"Остановлен. Выполнено действий: {performed}")
-        if window_closed:
-            messagebox.showwarning("Окно", "Окно закрыто — кликер остановлен.")
+        self._set_status(f"Остановлен. Выполнено действий: {performed}", HINT_COLOR)
+        self._update_window_state()
+        if reason:
+            messagebox.showwarning("Окно", reason)
 
     # ------------------------------------------------------------- update
     def check_updates(self) -> None:
@@ -480,7 +597,7 @@ class AutoClickerApp:
         self._updating = True
         self.update_btn.configure(state=tk.DISABLED)
         self.start_btn.configure(state=tk.DISABLED)
-        self.status_var.set("Проверка обновлений...")
+        self._set_status("Проверка обновлений…", HINT_COLOR)
         threading.Thread(target=self._update_worker, daemon=True).start()
 
     def _update_worker(self) -> None:
@@ -500,25 +617,23 @@ class AutoClickerApp:
 
     def _on_update_failed(self, message: str) -> None:
         self._finish_update_state()
-        self.status_var.set("Обновление не выполнено")
+        self._set_status("Обновление не выполнено", ERR_COLOR)
         messagebox.showerror("Обновление", message)
 
     def _on_update_done(self, result: updater.UpdateResult) -> None:
         self._finish_update_state()
         if not result.updated:
-            self.status_var.set("Обновлений нет")
+            self._set_status("Обновлений нет")
             messagebox.showinfo("Обновление", result.message)
             return
 
-        self.status_var.set("Обновление установлено")
+        self._set_status("Обновление установлено")
         if result.restart_cmd and messagebox.askyesno(
             "Обновление", f"{result.message}\n\nПерезапустить программу сейчас?"
         ):
             self._restart(result.restart_cmd)
         else:
-            messagebox.showinfo(
-                "Обновление", "Изменения вступят в силу после перезапуска программы."
-            )
+            messagebox.showinfo("Обновление", "Изменения вступят в силу после перезапуска программы.")
 
     def _restart(self, cmd: list[str]) -> None:
         self.stop()
