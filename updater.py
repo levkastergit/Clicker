@@ -40,6 +40,16 @@ PROTECTED = {".git", "build", "dist", "__pycache__", SHA_FILE}
 
 TIMEOUT = 20  # секунд на сетевые запросы
 
+# Переменные окружения бутлоадера PyInstaller (onefile). Наследуются дочерними
+# процессами, и запущенный из них новый экземпляр exe ломается.
+PYI_ENV_VARS = ("_PYI_APPLICATION_HOME_DIR", "_PYI_ARCHIVE_FILE", "_PYI_PARENT_PROCESS_LEVEL",
+                "_PYI_SPLASH_IPC", "_MEIPASS2", "_MEIPASS")
+
+
+def clean_env() -> dict[str, str]:
+    """Окружение для дочерних процессов без переменных бутлоадера PyInstaller."""
+    return {k: v for k, v in os.environ.items() if k not in PYI_ENV_VARS}
+
 
 class UpdateError(Exception):
     """Ошибка обновления с текстом для пользователя."""
@@ -223,27 +233,53 @@ def _update_frozen(current_version: str) -> UpdateResult:
     new_exe = tmp_dir / (asset_name or exe_path.name)
     new_exe.write_bytes(_http_get(asset_url))
 
-    pid = os.getpid()
-    # .bat ждёт завершения текущего процесса, подменяет exe и запускает его.
-    bat = tmp_dir / "apply_update.bat"
-    bat_lines = [
-        "@echo off",
-        "chcp 65001 >nul",
-        ":wait",
-        f'tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul',
-        "if not errorlevel 1 (timeout /t 1 /nobreak >nul & goto wait)",
-        f'copy /Y "{new_exe}" "{exe_path}" >nul',
-        f'start "" "{exe_path}"',
-        f'del "{new_exe}"',
-        '(goto) 2>nul & del "%~f0"',
-    ]
-    # newline="\r\n": иначе Windows превратит "\n" в "\r\n" ещё раз и получится "\r\r\n".
-    bat.write_text("\n".join(bat_lines) + "\n", encoding="utf-8", newline="\r\n")
+    bat = write_apply_script(new_exe, exe_path, tmp_dir)
     return UpdateResult(
         True,
         f"Скачана версия {data.get('tag_name')}. Программа перезапустится для установки.",
         restart_cmd=["cmd", "/c", str(bat)],
     )
+
+
+def write_apply_script(new_exe: Path, exe_path: Path, tmp_dir: Path, pid: int | None = None) -> Path:
+    """
+    Пишет .bat, который ждёт завершения текущего процесса, подменяет exe и запускает его.
+
+    Переменные _PYI_* ставит бутлоадер PyInstaller; если их не очистить, новый exe
+    сочтёт себя дочерним процессом старого и будет искать python*.dll в его
+    уже удалённой временной папке («Failed to load Python DLL»).
+    """
+    pid = os.getpid() if pid is None else pid
+    log = exe_path.parent / "update_error.log"
+    bat = tmp_dir / "apply_update.bat"
+    bat_lines = [
+        "@echo off",
+        "chcp 65001 >nul",
+        *[f'set "{name}="' for name in PYI_ENV_VARS],
+        "set /a tries=0",
+        ":wait",
+        f'tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul',
+        "if not errorlevel 1 (timeout /t 1 /nobreak >nul & goto wait)",
+        # Родительский процесс бутлоадера живёт ещё немного после дочернего и держит exe.
+        ":copy",
+        f'copy /Y "{new_exe}" "{exe_path}" >nul 2>&1',
+        "if not errorlevel 1 goto run",
+        "set /a tries+=1",
+        "if %tries% geq 30 goto fail",
+        "timeout /t 1 /nobreak >nul",
+        "goto copy",
+        ":run",
+        f'start "" "{exe_path}"',
+        f'del "{new_exe}"',
+        '(goto) 2>nul & del "%~f0"',
+        ":fail",
+        f'echo Не удалось заменить файл программы. Новая версия лежит здесь: {new_exe} > "{log}"',
+        f'start "" "{exe_path}"',
+        '(goto) 2>nul & del "%~f0"',
+    ]
+    # newline="\r\n": иначе Windows превратит "\n" в "\r\n" ещё раз и получится "\r\r\n".
+    bat.write_text("\n".join(bat_lines) + "\n", encoding="utf-8", newline="\r\n")
+    return bat
 
 
 # --------------------------------------------------------------------------

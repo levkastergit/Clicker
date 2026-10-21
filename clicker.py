@@ -28,7 +28,7 @@ from actions import KIND_KEY, KIND_MOUSE, KIND_PAUSE, KIND_TEXT, Position, Step
 from library import Library, NamedAction, NamedSequence, Profile, WindowIdentity, match_window
 from winapi import Hotkey, KeySpec, user32
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 
 # Спокойная палитра: без кислотных цветов.
 C_IDLE = "#5b6472"
@@ -1677,7 +1677,8 @@ class App(ctk.CTk):
         self.save_settings()
         self._shutdown()
         try:
-            subprocess.Popen(cmd, cwd=str(updater.app_dir()), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            subprocess.Popen(cmd, cwd=str(updater.app_dir()), env=updater.clean_env(),
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except OSError as exc:
             messagebox.showerror("Обновление", f"Не удалось перезапустить: {exc}")
             return
