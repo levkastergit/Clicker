@@ -1,8 +1,12 @@
 """
 Запись действий пользователя (клики, зажимы, клавиши) в последовательность шагов.
 
-Использует низкоуровневые хуки WH_MOUSE_LL / WH_KEYBOARD_LL в отдельном потоке
-с циклом сообщений. Программно сгенерированный ввод (флаг INJECTED) не записывается.
+Клавиатура — низкоуровневый хук WH_KEYBOARD_LL в отдельном потоке с циклом сообщений.
+Мышь — опрос состояния кнопок GetAsyncKeyState каждые несколько миллисекунд: хук мыши
+получает сотни событий движения в секунду, Windows молча снимает его при задержках
+обработчика, а клики от драйверов и утилит (Logitech, Razer, X-Mouse, удалённый
+рабочий стол) приходят с флагом INJECTED. Опросу всё это безразлично.
+Во время записи кликер ничего не отправляет сам, поэтому фильтр INJECTED не нужен.
 
 Нажатие и отпускание записываются парами: короткое нажатие становится кликом или
 нажатием клавиши, долгое (дольше HOLD_THRESHOLD) — зажимом на измеренное время.
@@ -32,9 +36,12 @@ LLMHF_INJECTED = 0x01
 HC_ACTION = 0
 HOLD_THRESHOLD = 0.35  # сек: дольше — считается зажимом
 
-_MOUSE_DOWN = {winapi.WM_LBUTTONDOWN: "left", winapi.WM_RBUTTONDOWN: "right", winapi.WM_MBUTTONDOWN: "middle"}
-_MOUSE_UP = {winapi.WM_LBUTTONUP: "left", winapi.WM_RBUTTONUP: "right", winapi.WM_MBUTTONUP: "middle"}
+_MOUSE_VKS = {0x01: "left", 0x02: "right", 0x04: "middle"}  # VK_LBUTTON, VK_RBUTTON, VK_MBUTTON
+MOUSE_POLL_INTERVAL = 0.006
 _MODIFIER_VKS = {0x10, 0x11, 0x12, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C}
+
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+user32.GetAsyncKeyState.restype = ctypes.c_short
 
 
 class MSLLHOOKSTRUCT(ctypes.Structure):
@@ -96,11 +103,16 @@ class Recorder:
         self._open_keys: dict[int, _Press] = {}
         self._hooks: list[int] = []
         self._procs: list = []
+        self._poll_thread: threading.Thread | None = None
+        self._poll_stop = threading.Event()
         self.target_hwnd = 0
         self.target_pid = 0
         self.ignore_vks: set[int] = set()
         self.active = False
         self.skipped = 0
+        # Диагностика: сколько сырых событий увидели
+        self.mouse_seen = 0
+        self.key_seen = 0
 
     # ------------------------------------------------------------------
     def start(self, target_hwnd: int, ignore_vks: set[int]) -> bool:
@@ -114,11 +126,16 @@ class Recorder:
         self._open_mouse = {}
         self._open_keys = {}
         self.skipped = 0
+        self.mouse_seen = 0
+        self.key_seen = 0
         self._ready.clear()
         self._thread = threading.Thread(target=self._run, name="recorder", daemon=True)
         self._thread.start()
         self._ready.wait(timeout=2.0)
-        self.active = bool(self._hooks)
+        self._poll_stop.clear()
+        self._poll_thread = threading.Thread(target=self._poll_mouse, name="recorder-mouse", daemon=True)
+        self._poll_thread.start()
+        self.active = True
         return self.active
 
     def preview(self) -> list[Step]:
@@ -128,6 +145,10 @@ class Recorder:
         return self._build_steps(presses)
 
     def stop(self) -> list[Step]:
+        self._poll_stop.set()
+        if self._poll_thread and self._poll_thread.is_alive():
+            self._poll_thread.join(timeout=1.0)
+        self._poll_thread = None
         if self._thread and self._thread.is_alive() and self._thread_id:
             user32.PostThreadMessageW(self._thread_id, winapi.WM_QUIT, 0, 0)
             self._thread.join(timeout=2.0)
@@ -148,15 +169,13 @@ class Recorder:
         msg = wintypes.MSG()
         user32.PeekMessageW(ctypes.byref(msg), None, winapi.WM_USER, winapi.WM_USER, 0)
 
-        mouse_proc = HOOKPROC(self._mouse_hook)
         kbd_proc = HOOKPROC(self._keyboard_hook)
-        self._procs = [mouse_proc, kbd_proc]  # защита от сборщика мусора
+        self._procs = [kbd_proc]  # защита от сборщика мусора
         hmod = kernel32.GetModuleHandleW(None)
         self._hooks = []
-        for hook_id, proc in ((WH_MOUSE_LL, mouse_proc), (WH_KEYBOARD_LL, kbd_proc)):
-            handle = user32.SetWindowsHookExW(hook_id, proc, hmod, 0)
-            if handle:
-                self._hooks.append(handle)
+        handle = user32.SetWindowsHookExW(WH_KEYBOARD_LL, kbd_proc, hmod, 0)
+        if handle:
+            self._hooks.append(handle)
         self._ready.set()
         try:
             while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
@@ -185,37 +204,61 @@ class Recorder:
                 return True
         return False
 
-    def _mouse_hook(self, code: int, wparam: int, lparam: int) -> int:
-        if code == HC_ACTION and (wparam in _MOUSE_DOWN or wparam in _MOUSE_UP):
-            info = ctypes.cast(lparam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
-            if not info.flags & LLMHF_INJECTED:
-                now = time.monotonic()
-                if wparam in _MOUSE_DOWN:
-                    button = _MOUSE_DOWN[wparam]
-                    if self._accepts_point(info.pt.x, info.pt.y):
-                        press = _Press("mouse", now, button=button, x=info.pt.x, y=info.pt.y)
-                        with self._lock:
-                            self._presses.append(press)
-                            self._open_mouse[button] = press
-                        self._emit("mouse")
-                    else:
-                        self.skipped += 1
-                        self._emit("skipped")
-                else:
-                    button = _MOUSE_UP[wparam]
-                    with self._lock:
-                        press = self._open_mouse.pop(button, None)
-                        if press is not None:
-                            press.up = now
-                    if press is not None:
-                        self._emit("mouse_up")
-        return user32.CallNextHookEx(None, code, wparam, lparam)
+    def _poll_mouse(self) -> None:
+        """Опрос кнопок мыши: переход «отпущена -> нажата» = клик в позиции курсора."""
+        down: dict[str, bool] = {name: False for name in _MOUSE_VKS.values()}
+        # Сбрасываем бит «была нажата с прошлого вызова», чтобы не записать клик по кнопке «Запись».
+        for vk in _MOUSE_VKS:
+            user32.GetAsyncKeyState(vk)
+        while not self._poll_stop.is_set():
+            for vk, button in _MOUSE_VKS.items():
+                state = user32.GetAsyncKeyState(vk)
+                pressed = bool(state & 0x8000)
+                if pressed and not down[button]:
+                    down[button] = True
+                    self._on_mouse_down(button)
+                elif not pressed and down[button]:
+                    down[button] = False
+                    self._on_mouse_up(button)
+                elif not pressed and (state & 0x0001):
+                    # Нажали и отпустили между двумя опросами — очень короткий клик.
+                    self._on_mouse_down(button)
+                    self._on_mouse_up(button)
+            self._poll_stop.wait(MOUSE_POLL_INTERVAL)
+        # На выходе отпускаем всё, что осталось «нажатым».
+        for button, is_down in down.items():
+            if is_down:
+                self._on_mouse_up(button)
+
+    def _on_mouse_down(self, button: str) -> None:
+        self.mouse_seen += 1
+        x, y = winapi.cursor_pos()
+        now = time.monotonic()
+        if self._accepts_point(x, y):
+            press = _Press("mouse", now, button=button, x=x, y=y)
+            with self._lock:
+                self._presses.append(press)
+                self._open_mouse[button] = press
+            self._emit("mouse")
+        else:
+            self.skipped += 1
+            self._emit("skipped")
+
+    def _on_mouse_up(self, button: str) -> None:
+        now = time.monotonic()
+        with self._lock:
+            press = self._open_mouse.pop(button, None)
+            if press is not None:
+                press.up = now
+        if press is not None:
+            self._emit("mouse_up")
 
     def _keyboard_hook(self, code: int, wparam: int, lparam: int) -> int:
         if code == HC_ACTION:
             info = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
             vk = int(info.vkCode)
-            if not info.flags & LLKHF_INJECTED and vk not in self.ignore_vks:
+            if vk not in self.ignore_vks and vk not in _MOUSE_VKS:
+                self.key_seen += 1
                 now = time.monotonic()
                 if wparam in (winapi.WM_KEYDOWN, winapi.WM_SYSKEYDOWN):
                     with self._lock:

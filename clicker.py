@@ -28,7 +28,7 @@ from actions import KIND_KEY, KIND_MOUSE, KIND_PAUSE, KIND_TEXT, Position, Step
 from library import Library, NamedAction, NamedSequence, Profile, WindowIdentity, match_window
 from winapi import Hotkey, KeySpec, user32
 
-__version__ = "2.2.0"
+__version__ = "2.2.1"
 
 # Спокойная палитра: без кислотных цветов.
 C_IDLE = "#5b6472"
@@ -1602,8 +1602,11 @@ class App(ctk.CTk):
             return
         preview = self.recorder.preview()
         self._refresh_tree(extra=preview)
-        skipped = f"  ·  кликов вне целевого окна: {self.recorder.skipped}" if self.recorder.skipped else ""
-        self._set_status(f"Запись… записано шагов: {len(preview)}{skipped}", C_REC)
+        rec = self.recorder
+        skipped = f", вне окна: {rec.skipped}" if rec.skipped else ""
+        self._set_status(
+            f"Запись… шагов: {len(preview)}  ·  событий: мышь {rec.mouse_seen}{skipped}, клавиши {rec.key_seen}", C_REC
+        )
         self.tray.set_state(tray.STATE_RECORDING, f"{len(preview)} шагов")
 
     # ------------------------------------------------ последовательность
