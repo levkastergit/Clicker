@@ -169,6 +169,86 @@ def type_text(
     return ok
 
 
+# --------------------------------------------------------------------------
+# Зажим
+# --------------------------------------------------------------------------
+HOLD_REPEAT_DELAY = 0.5    # задержка до автоповтора клавиши, как у клавиатуры
+HOLD_REPEAT_PERIOD = 0.033  # период автоповтора
+
+
+def _hold_loop(seconds: float, stop_event, tick: float, on_tick) -> None:
+    """Ждёт `seconds` (0 = до остановки), вызывая on_tick каждые `tick` секунд."""
+    deadline = None if seconds <= 0 else time.monotonic() + seconds
+    while not stop_event.is_set():
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        wait = tick if deadline is None else max(0.0, min(tick, deadline - time.monotonic()))
+        if stop_event.wait(wait):
+            break
+        on_tick()
+
+
+def hold_mouse(hwnd: int, button: str, x: int | None, y: int | None, seconds: float,
+               mode: str, stop_event) -> tuple[bool, int]:
+    """Зажимает кнопку мыши на `seconds` секунд (0 = до остановки) и отпускает."""
+    _, down_msg, up_msg, mk, down_flag, up_flag = winapi.MOUSE_BUTTONS[button]
+    if mode == MODE_SEND:
+        if x is not None and y is not None:
+            sx, sy = winapi.client_to_screen(hwnd, x, y)
+            if not move_cursor(sx, sy):
+                return False, hwnd
+            time.sleep(0.01)
+        ok = winapi.send_inputs([winapi.mouse_input(0, 0, down_flag)])
+        try:
+            _hold_loop(seconds, stop_event, 0.05, lambda: None)
+        finally:
+            winapi.send_inputs([winapi.mouse_input(0, 0, up_flag)])
+        return ok, hwnd
+
+    if x is None or y is None:
+        cx, cy = winapi.cursor_pos()
+        x, y = winapi.screen_to_client(hwnd, cx, cy)
+    target, tx, ty = winapi.child_at_client_point(hwnd, x, y)
+    lparam = winapi.make_lparam(tx, ty)
+    ok = bool(user32.PostMessageW(target, down_msg, mk, lparam))
+    try:
+        # Пока кнопка «зажата», окно получает WM_MOUSEMOVE с флагом кнопки, как при реальном удержании.
+        _hold_loop(seconds, stop_event, 0.05,
+                   lambda: user32.PostMessageW(target, winapi.WM_MOUSEMOVE, mk, lparam))
+    finally:
+        user32.PostMessageW(target, up_msg, 0, lparam)
+    return ok, target
+
+
+def hold_key(hwnd: int, key: KeySpec, seconds: float, mode: str, stop_event, fallback_child: int = 0) -> bool:
+    """Зажимает клавишу на `seconds` секунд (0 = до остановки) с автоповтором и отпускает."""
+    if mode == MODE_SEND:
+        down, up = _scan_inputs(key.vk)
+        ok = winapi.send_inputs([down])
+        try:
+            if not stop_event.wait(min(HOLD_REPEAT_DELAY, seconds) if seconds > 0 else HOLD_REPEAT_DELAY):
+                remaining = 0 if seconds <= 0 else max(0.0, seconds - HOLD_REPEAT_DELAY)
+                if seconds <= 0 or remaining > 0:
+                    _hold_loop(remaining, stop_event, HOLD_REPEAT_PERIOD, lambda: winapi.send_inputs([down]))
+        finally:
+            winapi.send_inputs([up])
+        return ok
+
+    target = winapi.focused_child(hwnd, fallback_child)
+    lparam_down, lparam_up = winapi.key_lparams(key.vk)
+    lparam_repeat = lparam_down | (1 << 30)  # бит «клавиша уже была нажата» — автоповтор
+    ok = bool(user32.PostMessageW(target, winapi.WM_KEYDOWN, key.vk, lparam_down))
+    try:
+        if not stop_event.wait(min(HOLD_REPEAT_DELAY, seconds) if seconds > 0 else HOLD_REPEAT_DELAY):
+            remaining = 0 if seconds <= 0 else max(0.0, seconds - HOLD_REPEAT_DELAY)
+            if seconds <= 0 or remaining > 0:
+                _hold_loop(remaining, stop_event, HOLD_REPEAT_PERIOD,
+                           lambda: user32.PostMessageW(target, winapi.WM_KEYDOWN, key.vk, lparam_repeat))
+    finally:
+        user32.PostMessageW(target, winapi.WM_KEYUP, key.vk, lparam_up)
+    return ok
+
+
 def prepare_window(hwnd: int, mode: str, activate: bool) -> None:
     """
     Активирует окно перед запуском. Для реального ввода это обязательно (ввод идёт

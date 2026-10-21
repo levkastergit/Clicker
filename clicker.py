@@ -28,7 +28,7 @@ from actions import KIND_KEY, KIND_MOUSE, KIND_PAUSE, KIND_TEXT, Position, Step
 from library import Library, NamedAction, NamedSequence, Profile, WindowIdentity, match_window
 from winapi import Hotkey, KeySpec, user32
 
-__version__ = "2.1.1"
+__version__ = "2.2.0"
 
 # Спокойная палитра: без кислотных цветов.
 C_IDLE = "#5b6472"
@@ -52,6 +52,12 @@ HOTKEY_TITLES = {
     "toggle": "Старт / Стоп",
     "capture": "Снять координаты под курсором",
     "record": "Запись последовательности",
+}
+MINIMIZED_LABELS = {
+    "background": "Развернуть без активации и спрятать под другие окна",
+    "offscreen": "Развернуть без активации и вынести за край экрана",
+    "ask": "Спросить перед запуском",
+    "leave": "Не трогать окно (ввод может игнорироваться)",
 }
 
 
@@ -186,10 +192,25 @@ class StepEditor(ctk.CTkFrame):
         self.button_seg = ctk.CTkSegmentedButton(row, values=["Левая", "Правая", "Средняя"])
         self.button_seg.set("Левая")
         self.button_seg.pack(side="left")
-        ctk.CTkLabel(row, text="Клик", width=60, anchor="e").pack(side="left", padx=(16, 8))
-        self.clicks_seg = ctk.CTkSegmentedButton(row, values=["Одинарный", "Двойной", "Тройной"])
+        ctk.CTkLabel(row, text="Действие", width=70, anchor="e").pack(side="left", padx=(16, 8))
+        self.mouse_act_seg = ctk.CTkSegmentedButton(row, values=["Клик", "Зажать"], command=lambda _v: self._show_kind())
+        self.mouse_act_seg.set("Клик")
+        self.mouse_act_seg.pack(side="left")
+
+        self.clicks_row = ctk.CTkFrame(p, fg_color="transparent")
+        self.clicks_row.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(self.clicks_row, text="Клик", width=110, anchor="w").pack(side="left")
+        self.clicks_seg = ctk.CTkSegmentedButton(self.clicks_row, values=["Одинарный", "Двойной", "Тройной"])
         self.clicks_seg.set("Одинарный")
         self.clicks_seg.pack(side="left")
+
+        self.mouse_hold_row = ctk.CTkFrame(p, fg_color="transparent")
+        self.mouse_hold_row.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(self.mouse_hold_row, text="Держать, сек", width=110, anchor="w").pack(side="left")
+        self.mouse_hold_var = ctk.StringVar(value="1")
+        ctk.CTkEntry(self.mouse_hold_row, textvariable=self.mouse_hold_var, width=70).pack(side="left")
+        ctk.CTkLabel(self.mouse_hold_row, text="0 = пока не остановят. Пока кнопка зажата, окно получает движения мыши с зажатой кнопкой.",
+                     text_color=C_MUTED).pack(side="left", padx=(12, 0))
 
         row = ctk.CTkFrame(p, fg_color="transparent")
         row.pack(fill="x", pady=(0, 8))
@@ -247,14 +268,30 @@ class StepEditor(ctk.CTkFrame):
 
         row = ctk.CTkFrame(p, fg_color="transparent")
         row.pack(fill="x", pady=(0, 6))
-        ctk.CTkLabel(row, text="Отправлять как", width=110, anchor="w").pack(side="left")
-        self.key_mode_seg = ctk.CTkSegmentedButton(row, values=["Нажатие клавиши", "Символ"])
+        ctk.CTkLabel(row, text="Действие", width=110, anchor="w").pack(side="left")
+        self.key_act_seg = ctk.CTkSegmentedButton(row, values=["Нажать", "Зажать"], command=lambda _v: self._show_kind())
+        self.key_act_seg.set("Нажать")
+        self.key_act_seg.pack(side="left")
+
+        self.key_mode_row = ctk.CTkFrame(p, fg_color="transparent")
+        self.key_mode_row.pack(fill="x", pady=(0, 6))
+        ctk.CTkLabel(self.key_mode_row, text="Отправлять как", width=110, anchor="w").pack(side="left")
+        self.key_mode_seg = ctk.CTkSegmentedButton(self.key_mode_row, values=["Нажатие клавиши", "Символ"])
         self.key_mode_seg.set("Нажатие клавиши")
         self.key_mode_seg.pack(side="left")
 
+        self.key_hold_row = ctk.CTkFrame(p, fg_color="transparent")
+        self.key_hold_row.pack(fill="x", pady=(0, 6))
+        ctk.CTkLabel(self.key_hold_row, text="Держать, сек", width=110, anchor="w").pack(side="left")
+        self.key_hold_var = ctk.StringVar(value="1")
+        ctk.CTkEntry(self.key_hold_row, textvariable=self.key_hold_var, width=70).pack(side="left")
+        ctk.CTkLabel(self.key_hold_row, text="0 = пока не остановят. Клавиша держится с автоповтором, как на клавиатуре.",
+                     text_color=C_MUTED).pack(side="left", padx=(12, 0))
+
         self.key_info_var = ctk.StringVar()
-        ctk.CTkLabel(p, textvariable=self.key_info_var, text_color=C_MUTED, anchor="w",
-                     justify="left", wraplength=620).pack(fill="x")
+        self.key_info_lbl = ctk.CTkLabel(p, textvariable=self.key_info_var, text_color=C_MUTED, anchor="w",
+                                         justify="left", wraplength=620)
+        self.key_info_lbl.pack(fill="x")
         self._on_group_change()
 
     # -------------------------------------------------------------- text
@@ -289,10 +326,18 @@ class StepEditor(ctk.CTkFrame):
             panel.pack_forget()
         self.panels[kind].pack(fill="x")
         if kind == KIND_MOUSE:
+            hold = self.mouse_act_seg.get() == "Зажать"
+            self.clicks_row.pack_forget()
+            self.mouse_hold_row.pack_forget()
+            self.pos_frame.pack_forget()
+            (self.mouse_hold_row if hold else self.clicks_row).pack(fill="x", pady=(0, 8))
             if self.pos_mode_var.get() == "fixed":
                 self.pos_frame.pack(fill="x")
-            else:
-                self.pos_frame.pack_forget()
+        elif kind == KIND_KEY:
+            hold = self.key_act_seg.get() == "Зажать"
+            self.key_mode_row.pack_forget()
+            self.key_hold_row.pack_forget()
+            (self.key_hold_row if hold else self.key_mode_row).pack(fill="x", pady=(0, 6), before=self.key_info_lbl)
 
     def _on_group_change(self) -> None:
         keys = winapi.KEY_GROUPS[self.group_var.get()]
@@ -343,12 +388,21 @@ class StepEditor(ctk.CTkFrame):
             self.pos_info_var.set(f"Снято: ({pos.x}, {pos.y}).")
 
     # ------------------------------------------------------- get / set
+    def _parse_hold(self, var: ctk.StringVar) -> float | None:
+        return parse_float(var.get(), "Держать, сек", 0.0)
+
     def get_step(self) -> Step | None:
         kind = self._kind()
         step = Step(kind=kind)
         if kind == KIND_MOUSE:
             step.button = {"Левая": "left", "Правая": "right", "Средняя": "middle"}[self.button_seg.get()]
             step.clicks = {"Одинарный": 1, "Двойной": 2, "Тройной": 3}[self.clicks_seg.get()]
+            step.hold = self.mouse_act_seg.get() == "Зажать"
+            if step.hold:
+                seconds = self._parse_hold(self.mouse_hold_var)
+                if seconds is None:
+                    return None
+                step.hold_seconds = seconds
             step.use_cursor = self.pos_mode_var.get() == "cursor"
             if not step.use_cursor:
                 x = parse_int(self.x_var.get(), "X")
@@ -365,7 +419,13 @@ class StepEditor(ctk.CTkFrame):
                 messagebox.showwarning("Действие", "Выберите клавишу или нажмите «Нажать клавишу…».")
                 return None
             step.key = self._key
-            step.key_mode = "char" if self.key_mode_seg.get() == "Символ" else "key"
+            step.hold = self.key_act_seg.get() == "Зажать"
+            if step.hold:
+                seconds = self._parse_hold(self.key_hold_var)
+                if seconds is None:
+                    return None
+                step.hold_seconds = seconds
+            step.key_mode = "key" if step.hold else ("char" if self.key_mode_seg.get() == "Символ" else "key")
             if step.key_mode == "char" and not step.key.char:
                 messagebox.showwarning("Действие", f"У клавиши {step.key.name} нет печатного символа. "
                                        "Выберите «Нажатие клавиши».")
@@ -383,6 +443,12 @@ class StepEditor(ctk.CTkFrame):
                 self.kind_seg.set(text)
         self.button_seg.set({"left": "Левая", "right": "Правая", "middle": "Средняя"}.get(step.button, "Левая"))
         self.clicks_seg.set({1: "Одинарный", 2: "Двойной", 3: "Тройной"}.get(step.clicks, "Одинарный"))
+        if step.kind == KIND_MOUSE:
+            self.mouse_act_seg.set("Зажать" if step.hold else "Клик")
+            self.mouse_hold_var.set(f"{step.hold_seconds:g}")
+        elif step.kind == KIND_KEY:
+            self.key_act_seg.set("Зажать" if step.hold else "Нажать")
+            self.key_hold_var.set(f"{step.hold_seconds:g}")
         self.pos_mode_var.set("cursor" if step.use_cursor else "fixed")
         self.x_var.set(str(step.position.x))
         self.y_var.set(str(step.position.y))
@@ -517,7 +583,7 @@ class App(ctk.CTk):
         winapi.enable_dpi_awareness()
         super().__init__()
         self.title(f"Автокликер {__version__}")
-        self.minsize(860, 680)
+        self.minsize(880, 800)
 
         self._settings = settings.load()
         self._ui_queue: queue.Queue[tuple[Callable, tuple]] = queue.Queue()
@@ -820,11 +886,23 @@ class App(ctk.CTk):
         self.restore_cursor_var = ctk.BooleanVar(value=True)
         ctk.CTkSwitch(opts, text="Вернуть курсор на место после остановки", variable=self.restore_cursor_var).pack(side="left", padx=(20, 0))
         ctk.CTkLabel(card, wraplength=720, justify="left", anchor="w", text_color=C_MUTED,
-                     text="Реальный ввод — максимум, доступный без драйвера: программы получают события из той же "
-                          "очереди, что и с физических устройств. Низкоуровневые хуки всё же могут отличить его по "
-                          "флагу INJECTED. В фоновом режиме клавиши идут в поле с фокусом внутри окна; у неактивного "
-                          "окна фокус часто сброшен, поэтому активация перед запуском помогает, а после клика клавиши "
-                          "идут туда, куда кликнули.").pack(fill="x", padx=14, pady=(0, 10))
+                     text="Реальный ввод — максимум без драйвера: события идут из той же очереди, что и с физических "
+                          "устройств, но низкоуровневые хуки могут отличить их по флагу INJECTED. В фоновом режиме клавиши "
+                          "идут в поле с фокусом внутри окна, поэтому активация перед запуском помогает.").pack(fill="x", padx=14, pady=(0, 10))
+
+        card = ctk.CTkFrame(tab, fg_color=C_CARD, corner_radius=10)
+        card.pack(fill="x", padx=6, pady=6)
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=14, pady=(10, 4))
+        ctk.CTkLabel(row, text="Если целевое окно свёрнуто", font=ctk.CTkFont(weight="bold"), anchor="w").pack(side="left")
+        self.minimized_var = ctk.StringVar(value=MINIMIZED_LABELS["background"])
+        ctk.CTkOptionMenu(row, values=list(MINIMIZED_LABELS.values()), variable=self.minimized_var, width=420,
+                          dynamic_resizing=False, command=lambda _v: self._update_window_state()).pack(side="left", padx=(12, 0))
+        ctk.CTkLabel(card, wraplength=720, justify="left", anchor="w", text_color=C_MUTED,
+                     text="Заставить чужую программу обрабатывать ввод в свёрнутом окне нельзя — это решает она сама. "
+                          "Обход: на время работы окно разворачивается, на миг активируется (чтобы программа восстановила "
+                          "фокус), затем прячется под другие окна или за край экрана, а после остановки сворачивается обратно.")\
+            .pack(fill="x", padx=14, pady=(0, 10))
 
         card = ctk.CTkFrame(tab, fg_color=C_CARD, corner_radius=10)
         card.pack(fill="x", padx=6, pady=6)
@@ -857,6 +935,7 @@ class App(ctk.CTk):
         self.activate_var.set(bool(s.get("activate_window", True)))
         self.restore_cursor_var.set(bool(s.get("restore_cursor", True)))
         self.tray_var.set(bool(s.get("minimize_to_tray", True)))
+        self.minimized_var.set(MINIMIZED_LABELS.get(s.get("minimized_policy", "background"), MINIMIZED_LABELS["background"]))
         mode = s.get("appearance", "dark")
         self.appearance_seg.set({"dark": "Тёмная", "light": "Светлая", "system": "Системная"}.get(mode, "Тёмная"))
         self._refresh_hotkey_labels()
@@ -879,8 +958,13 @@ class App(ctk.CTk):
             "restore_cursor": self.restore_cursor_var.get(),
             "appearance": self._appearance_code(),
             "minimize_to_tray": self.tray_var.get(),
+            "minimized_policy": self._minimized_policy(),
             "geometry": self.geometry(),
         }
+
+    def _minimized_policy(self) -> str:
+        label = self.minimized_var.get()
+        return next((code for code, text in MINIMIZED_LABELS.items() if text == label), "background")
 
     def save_settings(self) -> None:
         try:
@@ -977,7 +1061,13 @@ class App(ctk.CTk):
             self.window_state_var.set("окно закрыто — ждём его появления")
             self.window_state_lbl.configure(text_color=C_ERR)
         elif user32.IsIconic(hwnd):
-            self.window_state_var.set("окно свёрнуто — клики могут не обрабатываться")
+            policy = self._minimized_policy()
+            if policy in ("background", "offscreen") and self.input_mode_var.get() == input_backend.MODE_POST:
+                self.window_state_var.set("окно свёрнуто — на время работы будет развёрнуто в фоне")
+            elif self.input_mode_var.get() == input_backend.MODE_SEND:
+                self.window_state_var.set("окно свёрнуто — реальный ввод активирует его при запуске")
+            else:
+                self.window_state_var.set("окно свёрнуто — ввод может игнорироваться программой")
             self.window_state_lbl.configure(text_color=C_WARN)
         else:
             w, h = winapi.client_size(hwnd)
@@ -1326,7 +1416,8 @@ class App(ctk.CTk):
             step.delay_min, step.delay_max = imin, imax
             steps = [step]
 
-        if user32.IsIconic(hwnd):
+        policy = self._minimized_policy()
+        if user32.IsIconic(hwnd) and policy == "ask" and self.input_mode_var.get() == input_backend.MODE_POST:
             answer = messagebox.askyesnocancel(
                 "Окно свёрнуто",
                 "Выбранное окно свёрнуто. Большинство программ и игр не обрабатывают ввод, "
@@ -1344,6 +1435,7 @@ class App(ctk.CTk):
             activate_window=self.activate_var.get(),
             restore_cursor=self.restore_cursor_var.get(),
             fallback_child=self._focus_cache.get(hwnd, 0),
+            minimized_policy=policy,
         )
 
     def start(self) -> None:
@@ -1510,7 +1602,8 @@ class App(ctk.CTk):
             return
         preview = self.recorder.preview()
         self._refresh_tree(extra=preview)
-        self._set_status(f"Запись… записано шагов: {len(preview)}", C_REC)
+        skipped = f"  ·  кликов вне целевого окна: {self.recorder.skipped}" if self.recorder.skipped else ""
+        self._set_status(f"Запись… записано шагов: {len(preview)}{skipped}", C_REC)
         self.tray.set_state(tray.STATE_RECORDING, f"{len(preview)} шагов")
 
     # ------------------------------------------------ последовательность

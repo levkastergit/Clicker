@@ -112,6 +112,89 @@ kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 
+user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
+user32.SetWindowPos.restype = wintypes.BOOL
+
+SW_SHOWNOACTIVATE = 4
+SW_SHOWMINNOACTIVE = 7
+HWND_BOTTOM = 1
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+WM_MOUSEMOVE = 0x0200
+
+
+def window_rect(hwnd: int) -> tuple[int, int, int, int]:
+    rect = wintypes.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(rect))
+    return rect.left, rect.top, rect.right, rect.bottom
+
+
+class WindowKeeper:
+    """
+    Держит свёрнутое целевое окно «не свёрнутым» на время работы кликера.
+
+    policy:
+      "background" — развернуть без активации и положить под другие окна;
+      "offscreen"  — развернуть без активации и вынести за край экрана;
+      иначе         — ничего не делать.
+    restore() возвращает окно в исходное состояние.
+    """
+
+    def __init__(self, hwnd: int, policy: str) -> None:
+        self.hwnd = hwnd
+        self.policy = policy
+        self._was_iconic = False
+        self._rect: tuple[int, int, int, int] | None = None
+        self._moved = False
+
+    @property
+    def active(self) -> bool:
+        return self.policy in ("background", "offscreen")
+
+    def ensure_visible(self) -> bool:
+        """Если окно свёрнуто — разворачивает его в фоне. Возвращает True, если что-то сделал."""
+        if not self.active or not user32.IsWindow(self.hwnd) or not user32.IsIconic(self.hwnd):
+            return False
+        self._was_iconic = True
+        user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
+        if self._rect is None:
+            self._rect = window_rect(self.hwnd)
+        self._apply_position()
+        return True
+
+    def _apply_position(self) -> None:
+        if self.policy == "offscreen" and self._rect is not None:
+            left, top, right, bottom = self._rect
+            vx, vy, vw, vh = virtual_screen()
+            # Окно целиком за левым краем виртуального экрана: для системы оно развёрнуто и видимо.
+            user32.SetWindowPos(self.hwnd, HWND_BOTTOM, vx - (right - left) - 50, top, 0, 0,
+                                SWP_NOSIZE | SWP_NOACTIVATE)
+            self._moved = True
+        else:
+            user32.SetWindowPos(self.hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+
+    def push_back(self, previous_foreground: int) -> None:
+        """После кратковременной активации окна снова прячет его и возвращает прежнее активное окно."""
+        if not self.active or not self._was_iconic or not user32.IsWindow(self.hwnd):
+            return
+        self._apply_position()
+        if previous_foreground and previous_foreground != self.hwnd and user32.IsWindow(previous_foreground):
+            user32.SetForegroundWindow(previous_foreground)
+
+    def restore(self) -> None:
+        if not user32.IsWindow(self.hwnd):
+            return
+        if self._moved and self._rect is not None:
+            user32.SetWindowPos(self.hwnd, None, self._rect[0], self._rect[1], 0, 0,
+                                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+            self._moved = False
+        if self._was_iconic and not user32.IsIconic(self.hwnd):
+            user32.ShowWindow(self.hwnd, SW_SHOWMINNOACTIVE)
+        self._was_iconic = False
+
+
 def window_class(hwnd: int) -> str:
     buf = ctypes.create_unicode_buffer(256)
     user32.GetClassNameW(hwnd, buf, 256)

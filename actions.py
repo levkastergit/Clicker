@@ -96,21 +96,32 @@ class Step:
     # клавиша
     key: KeySpec | None = None
     key_mode: str = "key"             # "key" | "char"
+    # зажим (мышь или клавиша): держать hold_seconds, 0 = до остановки
+    hold: bool = False
+    hold_seconds: float = 1.0
     # текст
     text: str = ""
     # пауза после шага, сек (случайная в диапазоне)
     delay_min: float = 0.4
     delay_max: float = 0.6
 
+    def hold_text(self) -> str:
+        return "до остановки" if self.hold_seconds <= 0 else f"{self.hold_seconds:g} с"
+
     def describe(self) -> str:
         if self.kind == KIND_MOUSE:
             where = "в позиции курсора" if self.use_cursor else self.position.describe()
             spread = f", разброс ±{self.spread_x}/{self.spread_y}" if (self.spread_x or self.spread_y) else ""
+            if self.hold:
+                acc = {"left": "левую", "right": "правую", "middle": "среднюю"}.get(self.button, self.button)
+                return f"Зажать {acc} кнопку {where} на {self.hold_text()}{spread}"
             return (f"{winapi.MOUSE_BUTTON_LABELS[self.button]} кнопка, "
                     f"{CLICK_LABELS.get(self.clicks, self.clicks)} клик {where}{spread}")
         if self.kind == KIND_KEY:
             if self.key is None:
                 return "клавиша не выбрана"
+            if self.hold:
+                return f"Зажать {self.key.name} на {self.hold_text()}"
             how = "символ" if self.key_mode == "char" else "нажатие"
             return f"{self.key.name} ({how})"
         if self.kind == KIND_TEXT:
@@ -129,6 +140,7 @@ class Step:
             "use_cursor": self.use_cursor, "position": self.position.to_dict(),
             "spread_x": self.spread_x, "spread_y": self.spread_y,
             "key": self.key.to_dict() if self.key else None, "key_mode": self.key_mode,
+            "hold": self.hold, "hold_seconds": self.hold_seconds,
             "text": self.text, "delay_min": self.delay_min, "delay_max": self.delay_max,
         }
 
@@ -144,6 +156,8 @@ class Step:
             spread_y=int(d.get("spread_y", 0)),
             key=KeySpec.from_dict(d["key"]) if d.get("key") else None,
             key_mode=str(d.get("key_mode", "key")),
+            hold=bool(d.get("hold", False)),
+            hold_seconds=float(d.get("hold_seconds", 1.0)),
             text=str(d.get("text", "")),
             delay_min=float(d.get("delay_min", 0.4)),
             delay_max=float(d.get("delay_max", 0.6)),
@@ -162,6 +176,7 @@ class RunConfig:
     activate_window: bool = True          # активировать окно перед запуском
     restore_cursor: bool = True           # вернуть курсор после SendInput-клика
     fallback_child: int = 0               # окно фокуса цели, замеченное ранее (для фонового режима)
+    minimized_policy: str = "ask"         # ask | background | offscreen | leave (см. winapi.WindowKeeper)
 
 
 class Runner(threading.Thread):
@@ -197,11 +212,23 @@ class Runner(threading.Thread):
         failures = 0
         reason = ""
         origin = winapi.cursor_pos()
+        # В фоновом режиме свёрнутое окно разворачиваем без активации (под другие окна
+        # или за край экрана): для программы оно «не свёрнуто» и обрабатывает ввод.
+        keeper = winapi.WindowKeeper(cfg.hwnd, cfg.minimized_policy if cfg.input_mode == input_backend.MODE_POST else "leave")
         try:
             if not cfg.steps:
                 reason = "Нет ни одного действия."
                 return
+            previous_fg = user32.GetForegroundWindow()
+            keeper.ensure_visible()
             input_backend.prepare_window(cfg.hwnd, cfg.input_mode, cfg.activate_window)
+            # Пока окно активно, запоминаем его поле с фокусом: после того как окно
+            # уйдёт на задний план, фокус у него сбросится, а клавиши пойдут сюда.
+            focus = winapi.focused_child(cfg.hwnd)
+            if focus and focus != cfg.hwnd:
+                self._last_child = focus
+            if cfg.activate_window:
+                keeper.push_back(previous_fg)
             while not self._stop_event.is_set():
                 if cfg.repeat > 0 and iteration >= cfg.repeat:
                     break
@@ -223,11 +250,14 @@ class Runner(threading.Thread):
                             reason = (f"Окно не принимает ввод ({MAX_POST_FAILURES} ошибок подряд, "
                                       f"код {winapi.last_error()}). Кликер остановлен.")
                             return
+                    # Окно свернули во время работы — снова разворачиваем в фоне.
+                    keeper.ensure_visible()
                     self._on_progress(iteration, index, performed, bool(user32.IsIconic(cfg.hwnd)))
                     pause = random.uniform(step.delay_min, step.delay_max)
                     if self._stop_event.wait(pause):
                         break
         finally:
+            keeper.restore()
             if cfg.input_mode == input_backend.MODE_SEND and cfg.restore_cursor:
                 user32.SetCursorPos(*origin)
             self._on_finished(performed, reason)
@@ -244,13 +274,20 @@ class Runner(threading.Thread):
                 if step.spread_y > 0:
                     y += random.randint(-step.spread_y, step.spread_y)
                 x, y = max(0, x), max(0, y)
-            ok, target = input_backend.click(cfg.hwnd, step.button, x, y, step.clicks, cfg.input_mode)
+            if step.hold:
+                ok, target = input_backend.hold_mouse(cfg.hwnd, step.button, x, y, step.hold_seconds,
+                                                     cfg.input_mode, self._stop_event)
+            else:
+                ok, target = input_backend.click(cfg.hwnd, step.button, x, y, step.clicks, cfg.input_mode)
             if ok and target:
                 self._last_child = target
             return ok
         if step.kind == KIND_KEY:
             if step.key is None:
                 return False
+            if step.hold:
+                return input_backend.hold_key(cfg.hwnd, step.key, step.hold_seconds, cfg.input_mode,
+                                              self._stop_event, self._last_child)
             return input_backend.press_key(cfg.hwnd, step.key, step.key_mode, cfg.input_mode, self._last_child)
         if step.kind == KIND_TEXT:
             return input_backend.type_text(cfg.hwnd, step.text, cfg.input_mode, fallback_child=self._last_child)
