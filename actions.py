@@ -177,6 +177,7 @@ class RunConfig:
     restore_cursor: bool = True           # вернуть курсор после SendInput-клика
     fallback_child: int = 0               # окно фокуса цели, замеченное ранее (для фонового режима)
     minimized_policy: str = "ask"         # ask | background | offscreen | leave (см. winapi.WindowKeeper)
+    keep_foreground: bool = True          # реальный ввод: возвращать окно на передний план, если его свернули
 
 
 class Runner(threading.Thread):
@@ -239,6 +240,16 @@ class Runner(threading.Thread):
                     if not user32.IsWindow(cfg.hwnd):
                         reason = "Окно закрыто — кликер остановлен."
                         return
+                    # Реальный ввод уходит в активное окно: если цель свернули или перекрыли —
+                    # возвращаем её на передний план (иначе клики уйдут в другую программу).
+                    if (cfg.input_mode == input_backend.MODE_SEND and cfg.keep_foreground
+                            and user32.GetForegroundWindow() != cfg.hwnd):
+                        input_backend.prepare_window(cfg.hwnd, cfg.input_mode, True)
+                        if user32.GetForegroundWindow() != cfg.hwnd:
+                            self._on_progress(iteration, index, performed, True)
+                            if self._stop_event.wait(0.5):
+                                break
+                            continue
                     ok = self._execute(step)
                     if ok:
                         failures = 0

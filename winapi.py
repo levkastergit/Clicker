@@ -442,18 +442,54 @@ def virtual_screen() -> tuple[int, int, int, int]:
     )
 
 
+user32.BringWindowToTop.argtypes = [wintypes.HWND]
+user32.BringWindowToTop.restype = wintypes.BOOL
+user32.SwitchToThisWindow.argtypes = [wintypes.HWND, wintypes.BOOL]
+user32.SwitchToThisWindow.restype = None
+
+
 def bring_to_foreground(hwnd: int) -> bool:
-    """Активирует окно. Если система не разрешает, использует приём с нажатием Alt."""
+    """
+    Активирует окно. Windows разрешает SetForegroundWindow только активному процессу,
+    поэтому по очереди пробуем обходные приёмы: нажатие Alt, присоединение к очереди
+    ввода активного потока (AttachThreadInput), SwitchToThisWindow.
+    """
+    if not user32.IsWindow(hwnd):
+        return False
     if user32.IsIconic(hwnd):
         user32.ShowWindow(hwnd, SW_RESTORE)
-    if user32.GetForegroundWindow() == hwnd:
+
+    def done() -> bool:
+        return user32.GetForegroundWindow() == hwnd
+
+    if done():
         return True
-    if user32.SetForegroundWindow(hwnd) and user32.GetForegroundWindow() == hwnd:
+    user32.SetForegroundWindow(hwnd)
+    if done():
         return True
     # Нажатие Alt снимает ограничение на SetForegroundWindow для текущего процесса.
     send_inputs([key_input(VK_MENU, 0, 0), key_input(VK_MENU, 0, KEYEVENTF_KEYUP)])
     user32.SetForegroundWindow(hwnd)
-    return user32.GetForegroundWindow() == hwnd
+    if done():
+        return True
+    # Присоединяемся к очереди ввода активного потока и активируем окно от его имени.
+    fg = user32.GetForegroundWindow()
+    fg_tid = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+    our_tid = kernel32.GetCurrentThreadId()
+    attached = bool(fg_tid and fg_tid != our_tid and user32.AttachThreadInput(our_tid, fg_tid, True))
+    try:
+        user32.SetForegroundWindow(hwnd)
+        user32.BringWindowToTop(hwnd)
+    finally:
+        if attached:
+            user32.AttachThreadInput(our_tid, fg_tid, False)
+    if done():
+        return True
+    user32.SwitchToThisWindow(hwnd, True)
+    deadline = __import__("time").monotonic() + 0.3
+    while not done() and __import__("time").monotonic() < deadline:
+        __import__("time").sleep(0.02)
+    return done()
 
 
 def focused_child(hwnd: int, fallback: int = 0) -> int:

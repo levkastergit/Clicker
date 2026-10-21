@@ -28,7 +28,7 @@ from actions import KIND_KEY, KIND_MOUSE, KIND_PAUSE, KIND_TEXT, Position, Step
 from library import Library, NamedAction, NamedSequence, Profile, WindowIdentity, match_window
 from winapi import Hotkey, KeySpec, user32
 
-__version__ = "2.2.1"
+__version__ = "2.2.2"
 
 # Спокойная палитра: без кислотных цветов.
 C_IDLE = "#5b6472"
@@ -52,6 +52,12 @@ HOTKEY_TITLES = {
     "toggle": "Старт / Стоп",
     "capture": "Снять координаты под курсором",
     "record": "Запись последовательности",
+}
+# Классы окон игровых движков, которые читают ввод напрямую (Raw Input / опрос устройств),
+# а не из оконных сообщений: фоновый режим для них бесполезен.
+GAME_ENGINE_CLASSES = {
+    "UnityWndClass": "Unity",
+    "UnrealWindow": "Unreal Engine",
 }
 MINIMIZED_LABELS = {
     "background": "Развернуть без активации и спрятать под другие окна",
@@ -885,6 +891,9 @@ class App(ctk.CTk):
         ctk.CTkSwitch(opts, text="Активировать окно перед запуском", variable=self.activate_var).pack(side="left")
         self.restore_cursor_var = ctk.BooleanVar(value=True)
         ctk.CTkSwitch(opts, text="Вернуть курсор на место после остановки", variable=self.restore_cursor_var).pack(side="left", padx=(20, 0))
+        self.keep_fg_var = ctk.BooleanVar(value=True)
+        ctk.CTkSwitch(card, text="Реальный ввод: возвращать окно на передний план, если его свернули или перекрыли",
+                      variable=self.keep_fg_var).pack(anchor="w", padx=14, pady=(0, 8))
         ctk.CTkLabel(card, wraplength=720, justify="left", anchor="w", text_color=C_MUTED,
                      text="Реальный ввод — максимум без драйвера: события идут из той же очереди, что и с физических "
                           "устройств, но низкоуровневые хуки могут отличить их по флагу INJECTED. В фоновом режиме клавиши "
@@ -934,6 +943,7 @@ class App(ctk.CTk):
         self.input_mode_var.set(s.get("input_mode", input_backend.MODE_POST))
         self.activate_var.set(bool(s.get("activate_window", True)))
         self.restore_cursor_var.set(bool(s.get("restore_cursor", True)))
+        self.keep_fg_var.set(bool(s.get("keep_foreground", True)))
         self.tray_var.set(bool(s.get("minimize_to_tray", True)))
         self.minimized_var.set(MINIMIZED_LABELS.get(s.get("minimized_policy", "background"), MINIMIZED_LABELS["background"]))
         mode = s.get("appearance", "dark")
@@ -956,6 +966,7 @@ class App(ctk.CTk):
             "input_mode": self.input_mode_var.get(),
             "activate_window": self.activate_var.get(),
             "restore_cursor": self.restore_cursor_var.get(),
+            "keep_foreground": self.keep_fg_var.get(),
             "appearance": self._appearance_code(),
             "minimize_to_tray": self.tray_var.get(),
             "minimized_policy": self._minimized_policy(),
@@ -1075,9 +1086,12 @@ class App(ctk.CTk):
             self.window_state_lbl.configure(text_color=C_MUTED)
         if self.profile is not None:
             p = self.profile
+            engine = GAME_ENGINE_CLASSES.get(p.identity.class_name)
+            hint = (f"  ·  игра на {engine}: ввод читается напрямую с устройств, нужен «Реальный ввод» "
+                    f"и активное окно" if engine else "")
             self.profile_var.set(
                 f"Профиль: {p.identity.label}  ·  действий: {len(p.action_ids)}, "
-                f"последовательностей: {len(p.sequence_ids)}  ·  узнаётся по процессу и классу окна"
+                f"последовательностей: {len(p.sequence_ids)}{hint}"
             )
         else:
             self.profile_var.set("")
@@ -1436,6 +1450,7 @@ class App(ctk.CTk):
             restore_cursor=self.restore_cursor_var.get(),
             fallback_child=self._focus_cache.get(hwnd, 0),
             minimized_policy=policy,
+            keep_foreground=self.keep_fg_var.get(),
         )
 
     def start(self) -> None:
@@ -1469,7 +1484,9 @@ class App(ctk.CTk):
         text = f"Выполнено действий: {performed}"
         if total > 1:
             text += f"  ·  круг {iteration}, шаг {index + 1}/{total}"
-        if iconic:
+        if iconic and self.input_mode_var.get() == input_backend.MODE_SEND:
+            text += "  ·  окно не активно, реальный ввод не доходит — возвращаю его на передний план"
+        elif iconic:
             text += "  ·  окно свёрнуто, ввод может не доходить"
         self._set_status(text, C_WARN if iconic else C_RUN)
         self.tray.set_state(tray.STATE_RUNNING, f"{performed} действий")
