@@ -100,6 +100,10 @@ class Recorder:
         self.active = bool(self._hooks)
         return self.active
 
+    def preview(self) -> list[Step]:
+        """Шаги по уже записанным событиям (для живого отображения во время записи)."""
+        return self._build_steps(list(self._events))
+
     def stop(self) -> list[Step]:
         if self._thread and self._thread.is_alive() and self._thread_id:
             user32.PostThreadMessageW(self._thread_id, winapi.WM_QUIT, 0, 0)
@@ -107,7 +111,7 @@ class Recorder:
         self._thread = None
         self._thread_id = 0
         self.active = False
-        return self._build_steps()
+        return self._build_steps(list(self._events))
 
     # ------------------------------------------------------------------
     def _run(self) -> None:
@@ -161,10 +165,9 @@ class Recorder:
                 pass
 
     # ------------------------------------------------------------------
-    def _build_steps(self) -> list[Step]:
+    def _build_steps(self, events: list[tuple[float, str, dict]]) -> list[Step]:
         steps: list[Step] = []
         dbl_time = user32.GetDoubleClickTime() / 1000.0
-        events = self._events
         for i, (ts, kind, data) in enumerate(events):
             next_ts = events[i + 1][0] if i + 1 < len(events) else ts + 0.5
             delay = max(0.05, round(next_ts - ts, 2))

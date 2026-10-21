@@ -25,9 +25,10 @@ import tray
 import updater
 import winapi
 from actions import KIND_KEY, KIND_MOUSE, KIND_PAUSE, KIND_TEXT, Position, Step
+from library import Library, NamedAction, NamedSequence, Profile, WindowIdentity, match_window
 from winapi import Hotkey, KeySpec, user32
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 # Спокойная палитра: без кислотных цветов.
 C_IDLE = "#5b6472"
@@ -463,6 +464,51 @@ class StepDialog(ctk.CTkToplevel):
         self.destroy()
 
 
+class LibraryPickDialog(ctk.CTkToplevel):
+    """Выбор элемента библиотеки, привязанного к другим окнам (или ни к одному)."""
+
+    def __init__(self, app: "App", title: str, items: list[tuple[str, str, str]]) -> None:
+        super().__init__(app)
+        self.result: tuple[str, str] | None = None  # (id, "link" | "copy")
+        self.title(title)
+        self.resizable(False, False)
+        self.transient(app)
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(padx=20, pady=16, fill="both")
+        ctk.CTkLabel(body, text=title, font=ctk.CTkFont(size=15, weight="bold"), anchor="w").pack(fill="x")
+        ctk.CTkLabel(body, text="«Привязать» — один элемент на несколько окон, правки видны везде. "
+                     "«Копировать» — независимая копия для этого окна.",
+                     text_color=C_MUTED, anchor="w", justify="left", wraplength=520).pack(fill="x", pady=(4, 10))
+        self.choice = ctk.StringVar(value=items[0][0] if items else "")
+        box = ctk.CTkScrollableFrame(body, width=540, height=min(260, 36 * max(1, len(items)) + 10))
+        box.pack(fill="x")
+        for item_id, name, windows in items:
+            ctk.CTkRadioButton(box, text=f"{name}   —   {windows}", variable=self.choice, value=item_id).pack(anchor="w", pady=3)
+        btns = ctk.CTkFrame(body, fg_color="transparent")
+        btns.pack(fill="x", pady=(14, 0))
+        ctk.CTkButton(btns, text="Копировать", width=120, command=lambda: self._done("copy")).pack(side="right")
+        ctk.CTkButton(btns, text="Привязать", width=120, command=lambda: self._done("link")).pack(side="right", padx=(0, 8))
+        ctk.CTkButton(btns, text="Отмена", width=100, fg_color=C_IDLE, command=self.destroy).pack(side="right", padx=(0, 8))
+        self.after(120, self.grab_set)
+        self.after(120, self.focus_force)
+
+    def _done(self, mode: str) -> None:
+        if self.choice.get():
+            self.result = (self.choice.get(), mode)
+        self.destroy()
+
+
+def ask_name(app: "App", title: str, text: str, initial: str = "") -> str | None:
+    dialog = ctk.CTkInputDialog(text=text, title=title)
+    if initial:
+        dialog.after(150, lambda: (dialog._entry.insert(0, initial), dialog._entry.select_range(0, "end")))
+    value = dialog.get_input()
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
 # ==========================================================================
 # Главное окно
 # ==========================================================================
@@ -471,26 +517,37 @@ class App(ctk.CTk):
         winapi.enable_dpi_awareness()
         super().__init__()
         self.title(f"Автокликер {__version__}")
-        self.minsize(820, 640)
+        self.minsize(860, 680)
 
         self._settings = settings.load()
-        # Tk не потокобезопасен: рабочие потоки кладут вызовы в очередь,
-        # главный поток выполняет их по порядку.
         self._ui_queue: queue.Queue[tuple[Callable, tuple]] = queue.Queue()
         self._windows: list[tuple[int, str]] = []
         self._window_by_label: dict[str, int] = {}
+        self._identity_by_hwnd: dict[int, WindowIdentity] = {}
         self._runner: actions.Runner | None = None
         self._updating = False
+        self._closing = False
         self._capture_consumer: StepEditor | None = None
-        self._steps: list[Step] = actions.sequence_from_dict(self._settings.get("sequence", {}).get("steps"))
-        self._hotkeys: dict[str, Hotkey | None] = {
-            name: Hotkey.from_dict(self._settings.get("hotkeys", {}).get(name)) or DEFAULT_HOTKEYS[name]
-            for name in DEFAULT_HOTKEYS
-        }
-        if "hotkeys" in self._settings:
-            for name in DEFAULT_HOTKEYS:
-                if name in self._settings["hotkeys"] and self._settings["hotkeys"][name] is None:
-                    self._hotkeys[name] = None
+        self._focus_cache: dict[int, int] = {}
+        self._loading = False
+
+        self.library = Library.from_dict(self._settings.get("library"))
+        if "library" not in self._settings and ("single" in self._settings or "sequence" in self._settings):
+            self.library.migrate_v2(self._settings)
+        self.profile: Profile | None = None
+        self._current_action: NamedAction | None = None
+        self._current_sequence: NamedSequence | None = None
+        self._steps: list[Step] = []
+        self._action_by_label: dict[str, str] = {}
+        self._sequence_by_label: dict[str, str] = {}
+
+        self._hotkeys: dict[str, Hotkey | None] = {}
+        saved_hk = self._settings.get("hotkeys") or {}
+        for name in DEFAULT_HOTKEYS:
+            if name in saved_hk:
+                self._hotkeys[name] = Hotkey.from_dict(saved_hk[name])
+            else:
+                self._hotkeys[name] = DEFAULT_HOTKEYS[name]
 
         ctk.set_appearance_mode(self._settings.get("appearance", "dark"))
         ctk.set_default_color_theme("dark-blue")
@@ -502,7 +559,7 @@ class App(ctk.CTk):
 
         self.hotkey_manager = hotkeys.HotkeyManager(self._on_hotkey_thread)
         self._register_hotkeys()
-        self.recorder = recorder.Recorder()
+        self.recorder = recorder.Recorder(on_event=lambda kind: self.post_ui(self._on_record_event))
         self.tray = tray.TrayIcon(
             on_show=lambda: self.post_ui(self.show_window),
             on_toggle=lambda: self.post_ui(self.toggle_run),
@@ -514,21 +571,9 @@ class App(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self.quit_app)
         self.bind("<Unmap>", self._on_unmap)
         self._set_status("Готов")
-        self._closing = False
-        # Запоминаем окно фокуса цели, пока она активна: у неактивного окна фокус сброшен.
-        self._focus_cache: dict[int, int] = {}
-        self.after(30, self._drain_ui_queue)
-        self.after(1000, self._poll_target_focus)
-
-    def _poll_target_focus(self) -> None:
-        if self._closing:
-            return
-        hwnd = self.target_hwnd()
-        if hwnd and user32.IsWindow(hwnd):
-            focus = winapi.focused_child(hwnd)
-            if focus and focus != hwnd:
-                self._focus_cache[hwnd] = focus
-        self.after(1000, self._poll_target_focus)
+        self._timers: dict[str, str] = {}
+        self._timers["queue"] = self.after(30, self._drain_ui_queue)
+        self._timers["poll"] = self.after(1000, self._poll_target)
 
     # ------------------------------------------------ межпоточные вызовы
     def post_ui(self, fn: Callable, *args) -> None:
@@ -545,11 +590,26 @@ class App(ctk.CTk):
                 break
             try:
                 fn(*args)
-            except Exception:  # noqa: BLE001 — ошибка одного вызова не должна остановить очередь
+            except Exception:  # noqa: BLE001
                 import traceback
                 traceback.print_exc()
         if not self._closing:
-            self.after(30, self._drain_ui_queue)
+            self._timers["queue"] = self.after(30, self._drain_ui_queue)
+
+    def _poll_target(self) -> None:
+        """Раз в секунду: запоминаем окно фокуса цели и находим окно заново после перезапуска."""
+        if self._closing:
+            return
+        hwnd = self.target_hwnd()
+        if hwnd and user32.IsWindow(hwnd):
+            focus = winapi.focused_child(hwnd)
+            if focus and focus != hwnd:
+                self._focus_cache[hwnd] = focus
+        elif self.profile is not None and self._runner is None and not self.recorder.active:
+            if self._try_rebind_window():
+                self._set_status(f"Окно «{self.profile.identity.title}» найдено заново после перезапуска", C_RUN)
+        if not self._closing:
+            self._timers["poll"] = self.after(1000, self._poll_target)
 
     # --------------------------------------------------------------- UI
     def _set_icon(self) -> None:
@@ -567,19 +627,17 @@ class App(ctk.CTk):
         bg = "#1f2124" if dark else "#ffffff"
         fg = "#e5e7eb" if dark else "#1f2937"
         head = "#2b2d31" if dark else "#e5e7eb"
-        sel = "#1f6aa5"
         style.configure("Treeview", background=bg, fieldbackground=bg, foreground=fg,
                         rowheight=30, borderwidth=0, font=("Segoe UI", 10))
         style.configure("Treeview.Heading", background=head, foreground=fg, relief="flat",
                         font=("Segoe UI Semibold", 10), padding=6)
-        style.map("Treeview", background=[("selected", sel)], foreground=[("selected", "#ffffff")])
+        style.map("Treeview", background=[("selected", "#1f6aa5")], foreground=[("selected", "#ffffff")])
         style.map("Treeview.Heading", background=[("active", head)])
 
     def _build_ui(self) -> None:
         root = ctk.CTkFrame(self, fg_color="transparent")
         root.pack(fill="both", expand=True, padx=18, pady=(14, 10))
 
-        # --- шапка
         header = ctk.CTkFrame(root, fg_color="transparent")
         header.pack(fill="x", pady=(0, 10))
         titles = ctk.CTkFrame(header, fg_color="transparent")
@@ -587,7 +645,6 @@ class App(ctk.CTk):
         ctk.CTkLabel(titles, text="Автокликер", font=ctk.CTkFont(size=24, weight="bold")).pack(anchor="w")
         ctk.CTkLabel(titles, text="клики, клавиши и последовательности в выбранное окно",
                      text_color=C_MUTED).pack(anchor="w")
-
         controls = ctk.CTkFrame(header, fg_color="transparent")
         controls.pack(side="right")
         self.status_pill = ctk.CTkLabel(controls, text="  Остановлен  ", fg_color=C_IDLE, corner_radius=14,
@@ -602,28 +659,30 @@ class App(ctk.CTk):
                                       fg_color=C_STOP, hover_color=C_STOP_HOVER, state="disabled", command=self.stop)
         self.stop_btn.pack(side="left", padx=(8, 0))
 
-        # --- целевое окно
+        # --- целевое окно и профиль
         card = ctk.CTkFrame(root, fg_color=C_CARD, corner_radius=12)
         card.pack(fill="x", pady=(0, 10))
         row = ctk.CTkFrame(card, fg_color="transparent")
         row.pack(fill="x", padx=14, pady=(12, 4))
         ctk.CTkLabel(row, text="Целевое окно", font=ctk.CTkFont(weight="bold"), width=110, anchor="w").pack(side="left")
         self.window_var = ctk.StringVar()
-        self.window_menu = ctk.CTkOptionMenu(row, values=[""], variable=self.window_var, width=430,
-                                             dynamic_resizing=False, command=lambda _v: self._update_window_state())
+        self.window_menu = ctk.CTkOptionMenu(row, values=[""], variable=self.window_var, width=470,
+                                             dynamic_resizing=False, command=lambda _v: self._on_window_selected())
         self.window_menu.pack(side="left")
         ctk.CTkButton(row, text="Обновить список", width=130, command=self.refresh_windows).pack(side="left", padx=(8, 0))
         row2 = ctk.CTkFrame(card, fg_color="transparent")
-        row2.pack(fill="x", padx=14, pady=(0, 10))
+        row2.pack(fill="x", padx=14, pady=(0, 4))
         ctk.CTkLabel(row2, text="Что запускать", width=110, anchor="w").pack(side="left")
-        self.run_mode_seg = ctk.CTkSegmentedButton(row2, values=["Одно действие", "Последовательность"])
+        self.run_mode_seg = ctk.CTkSegmentedButton(row2, values=["Одно действие", "Последовательность"],
+                                                   command=lambda _v: self._commit_current())
         self.run_mode_seg.set("Одно действие")
         self.run_mode_seg.pack(side="left")
         self.window_state_var = ctk.StringVar()
         self.window_state_lbl = ctk.CTkLabel(row2, textvariable=self.window_state_var, text_color=C_MUTED, anchor="w")
         self.window_state_lbl.pack(side="left", padx=(16, 0))
+        self.profile_var = ctk.StringVar()
+        ctk.CTkLabel(card, textvariable=self.profile_var, text_color=C_MUTED, anchor="w").pack(fill="x", padx=14, pady=(0, 10))
 
-        # --- вкладки
         self.tabs = ctk.CTkTabview(root, corner_radius=12)
         self.tabs.pack(fill="both", expand=True)
         self._build_action_tab(self.tabs.add("Действие"))
@@ -631,7 +690,6 @@ class App(ctk.CTk):
         self._build_hotkeys_tab(self.tabs.add("Горячие клавиши"))
         self._build_settings_tab(self.tabs.add("Настройки"))
 
-        # --- строка статуса
         bar = ctk.CTkFrame(root, fg_color="transparent")
         bar.pack(fill="x", pady=(8, 0))
         self.status_var = ctk.StringVar(value="Готов")
@@ -640,9 +698,27 @@ class App(ctk.CTk):
         self.hint_var = ctk.StringVar()
         ctk.CTkLabel(bar, textvariable=self.hint_var, text_color=C_MUTED).pack(side="right")
 
+    def _build_item_row(self, parent, label: str, on_select, on_new, on_rename, on_delete, on_library):
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=6, pady=(6, 8))
+        ctk.CTkLabel(row, text=label, font=ctk.CTkFont(weight="bold"), width=140, anchor="w").pack(side="left")
+        var = ctk.StringVar()
+        menu = ctk.CTkOptionMenu(row, values=["—"], variable=var, width=260, dynamic_resizing=False,
+                                 command=lambda _v: on_select())
+        menu.pack(side="left")
+        ctk.CTkButton(row, text="Новое", width=70, command=on_new).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(row, text="Переименовать", width=120, fg_color=C_IDLE, command=on_rename).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(row, text="Удалить", width=80, fg_color=C_IDLE, command=on_delete).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(row, text="Из других окон…", width=130, fg_color=C_IDLE, command=on_library).pack(side="left", padx=(6, 0))
+        return var, menu
+
     def _build_action_tab(self, tab) -> None:
+        self.action_var, self.action_menu = self._build_item_row(
+            tab, "Действие", self._on_action_pick, self.action_new, self.action_rename,
+            self.action_delete, self.action_from_library,
+        )
         self.action_editor = StepEditor(tab, self, show_pause=False)
-        self.action_editor.pack(fill="x", padx=6, pady=(6, 10))
+        self.action_editor.pack(fill="x", padx=6, pady=(0, 10))
 
         box = ctk.CTkFrame(tab, fg_color=C_CARD, corner_radius=10)
         box.pack(fill="x", padx=6)
@@ -661,18 +737,22 @@ class App(ctk.CTk):
         ctk.CTkLabel(row, text="0 = бесконечно", text_color=C_MUTED).pack(side="left", padx=(8, 0))
 
     def _build_sequence_tab(self, tab) -> None:
+        self.sequence_var, self.sequence_menu = self._build_item_row(
+            tab, "Последовательность", self._on_sequence_pick, self.sequence_new, self.sequence_rename,
+            self.sequence_delete, self.sequence_from_library,
+        )
         top = ctk.CTkFrame(tab, fg_color="transparent")
-        top.pack(fill="x", padx=6, pady=(6, 6))
-        ctk.CTkButton(top, text="＋ Добавить", width=110, command=self.seq_add).pack(side="left")
+        top.pack(fill="x", padx=6, pady=(0, 6))
+        ctk.CTkButton(top, text="＋ Шаг", width=90, command=self.seq_add).pack(side="left")
         ctk.CTkButton(top, text="Изменить", width=90, command=self.seq_edit).pack(side="left", padx=(6, 0))
-        ctk.CTkButton(top, text="Удалить", width=90, fg_color=C_IDLE, command=self.seq_delete).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(top, text="Удалить", width=80, fg_color=C_IDLE, command=self.seq_delete).pack(side="left", padx=(6, 0))
         ctk.CTkButton(top, text="▲", width=36, fg_color=C_IDLE, command=lambda: self.seq_move(-1)).pack(side="left", padx=(12, 0))
         ctk.CTkButton(top, text="▼", width=36, fg_color=C_IDLE, command=lambda: self.seq_move(1)).pack(side="left", padx=(4, 0))
         self.record_btn = ctk.CTkButton(top, text="● Запись", width=100, fg_color=C_REC, hover_color="#a2443e",
                                         command=self.toggle_record)
         self.record_btn.pack(side="left", padx=(12, 0))
-        ctk.CTkButton(top, text="Открыть…", width=90, fg_color=C_IDLE, command=self.seq_load).pack(side="right")
-        ctk.CTkButton(top, text="Сохранить…", width=100, fg_color=C_IDLE, command=self.seq_save).pack(side="right", padx=(0, 6))
+        ctk.CTkButton(top, text="Импорт…", width=90, fg_color=C_IDLE, command=self.seq_load).pack(side="right")
+        ctk.CTkButton(top, text="Экспорт…", width=90, fg_color=C_IDLE, command=self.seq_save).pack(side="right", padx=(0, 6))
 
         bottom = ctk.CTkFrame(tab, fg_color="transparent")
         bottom.pack(side="bottom", fill="x", padx=6, pady=(8, 4))
@@ -694,6 +774,7 @@ class App(ctk.CTk):
         self.tree.column("kind", width=130, stretch=False)
         self.tree.column("desc", width=420)
         self.tree.column("delay", width=110, anchor="center", stretch=False)
+        self.tree.tag_configure("rec", foreground="#e07b73")
         self.tree.pack(side="left", fill="both", expand=True)
         self.tree.bind("<Double-1>", lambda _e: self.seq_edit())
         sb = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
@@ -716,11 +797,11 @@ class App(ctk.CTk):
             ctk.CTkButton(row, text="Отключить", width=100, fg_color=C_IDLE,
                           command=lambda n=name: self.change_hotkey(n, clear=True)).pack(side="left", padx=(6, 14))
         ctk.CTkLabel(
-            tab, wraplength=700, justify="left", anchor="w", text_color=C_MUTED,
+            tab, wraplength=720, justify="left", anchor="w", text_color=C_MUTED,
             text="Съём координат: откройте целевое окно, наведите курсор на нужную точку и нажмите сочетание. "
                  "Окно под курсором станет целевым, координаты запишутся во вкладку «Действие» или в открытый "
-                 "диалог шага. Запись: нажмите сочетание, выполните клики и нажатия в целевом окне, нажмите ещё раз — "
-                 "шаги добавятся в последовательность.",
+                 "диалог шага. Запись: нажмите сочетание, выполните клики и нажатия в целевом окне — шаги появляются "
+                 "в последовательности сразу; нажмите ещё раз, чтобы закончить.",
         ).pack(fill="x", padx=8, pady=(12, 0))
 
     def _build_settings_tab(self, tab) -> None:
@@ -738,7 +819,7 @@ class App(ctk.CTk):
         ctk.CTkSwitch(opts, text="Активировать окно перед запуском", variable=self.activate_var).pack(side="left")
         self.restore_cursor_var = ctk.BooleanVar(value=True)
         ctk.CTkSwitch(opts, text="Вернуть курсор на место после остановки", variable=self.restore_cursor_var).pack(side="left", padx=(20, 0))
-        ctk.CTkLabel(card, wraplength=700, justify="left", anchor="w", text_color=C_MUTED,
+        ctk.CTkLabel(card, wraplength=720, justify="left", anchor="w", text_color=C_MUTED,
                      text="Реальный ввод — максимум, доступный без драйвера: программы получают события из той же "
                           "очереди, что и с физических устройств. Низкоуровневые хуки всё же могут отличить его по "
                           "флагу INJECTED. В фоновом режиме клавиши идут в поле с фокусом внутри окна; у неактивного "
@@ -750,10 +831,9 @@ class App(ctk.CTk):
         row = ctk.CTkFrame(card, fg_color="transparent")
         row.pack(fill="x", padx=14, pady=10)
         ctk.CTkLabel(row, text="Оформление", width=110, anchor="w").pack(side="left")
-        self.appearance_var = ctk.StringVar(value="dark")
-        ctk.CTkSegmentedButton(row, values=["Тёмная", "Светлая", "Системная"],
-                               command=self._on_appearance).pack(side="left")
-        self.appearance_seg = row.winfo_children()[-1]
+        self.appearance_seg = ctk.CTkSegmentedButton(row, values=["Тёмная", "Светлая", "Системная"],
+                                                     command=self._on_appearance)
+        self.appearance_seg.pack(side="left")
         self.tray_var = ctk.BooleanVar(value=True)
         ctk.CTkSwitch(row, text="Сворачивать в трей", variable=self.tray_var).pack(side="left", padx=(24, 0))
 
@@ -765,21 +845,14 @@ class App(ctk.CTk):
         self.update_btn = ctk.CTkButton(row, text="Обновить программу", width=170, command=self.check_updates)
         self.update_btn.pack(side="left")
         ctk.CTkLabel(row, text=updater.REPO_URL, text_color=C_MUTED).pack(side="left", padx=(14, 0))
+        ctk.CTkLabel(card, wraplength=720, justify="left", anchor="w", text_color=C_MUTED,
+                     text=f"Профили окон, действия и последовательности хранятся в {settings.settings_path()}. "
+                          "Окно узнаётся по имени процесса, классу окна и заголовку, поэтому после перезапуска "
+                          "программы-цели её действия подхватываются автоматически.").pack(fill="x", padx=14, pady=(0, 10))
 
     # ------------------------------------------------------- настройки
     def _apply_settings(self) -> None:
         s = self._settings
-        self.run_mode_seg.set("Последовательность" if s.get("run_mode") == "sequence" else "Одно действие")
-        single = s.get("single") or {}
-        if single.get("step"):
-            try:
-                self.action_editor.set_step(Step.from_dict(single["step"]))
-            except (TypeError, ValueError, KeyError):
-                pass
-        self.interval_min_var.set(str(single.get("interval_min", "0.4")))
-        self.interval_max_var.set(str(single.get("interval_max", "0.6")))
-        self.count_var.set(str(single.get("count", "0")))
-        self.repeat_var.set(str((s.get("sequence") or {}).get("repeat", "0")))
         self.input_mode_var.set(s.get("input_mode", input_backend.MODE_POST))
         self.activate_var.set(bool(s.get("activate_window", True)))
         self.restore_cursor_var.set(bool(s.get("restore_cursor", True)))
@@ -790,24 +863,16 @@ class App(ctk.CTk):
         geo = s.get("geometry")
         if isinstance(geo, str) and "x" in geo:
             try:
-                # Восстанавливаем только размер: позиция может оказаться за пределами экрана.
                 self.geometry(geo.split("+", 1)[0])
             except Exception:  # noqa: BLE001
                 pass
 
     def _collect_settings(self) -> dict:
-        step = self.action_editor.get_step() if self._quiet_step() else None
+        self._commit_current()
         return {
-            "version": 2,
-            "window_title": self.window_var.get(),
-            "run_mode": "sequence" if self.run_mode_seg.get() == "Последовательность" else "single",
-            "single": {
-                "step": step.to_dict() if step else (self._settings.get("single") or {}).get("step"),
-                "interval_min": self.interval_min_var.get(),
-                "interval_max": self.interval_max_var.get(),
-                "count": self.count_var.get(),
-            },
-            "sequence": {"steps": actions.sequence_to_dict(self._steps), "repeat": self.repeat_var.get()},
+            "version": 3,
+            "library": self.library.to_dict(),
+            "last_profile": self.profile.identity.key if self.profile else None,
             "hotkeys": {name: (hk.to_dict() if hk else None) for name, hk in self._hotkeys.items()},
             "input_mode": self.input_mode_var.get(),
             "activate_window": self.activate_var.get(),
@@ -817,27 +882,13 @@ class App(ctk.CTk):
             "geometry": self.geometry(),
         }
 
-    def _quiet_step(self) -> bool:
-        """Можно ли собрать шаг без диалогов об ошибках (для автосохранения)."""
-        e = self.action_editor
-        if e._kind() == KIND_MOUSE and e.pos_mode_var.get() == "fixed":
-            for v in (e.x_var, e.y_var, e.spread_x_var, e.spread_y_var):
-                try:
-                    int(v.get().strip())
-                except ValueError:
-                    return False
-        if e._kind() == KIND_KEY and e._key is None:
-            return False
-        if e._kind() == KIND_TEXT and not e.text_var.get():
-            return False
-        return True
-
     def save_settings(self) -> None:
         try:
             self._settings = self._collect_settings()
             settings.save(self._settings)
-        except Exception:  # noqa: BLE001 — сохранение не должно мешать работе
-            pass
+        except Exception:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
 
     def _appearance_code(self) -> str:
         return {"Тёмная": "dark", "Светлая": "light", "Системная": "system"}.get(self.appearance_seg.get(), "dark")
@@ -850,49 +901,80 @@ class App(ctk.CTk):
     def refresh_windows(self, select_saved: bool = False) -> None:
         own = user32.GetAncestor(self.winfo_id(), winapi.GA_ROOT)
         self._windows = [(h, t) for h, t in winapi.enum_windows() if h != own]
+        self._identity_by_hwnd = {h: WindowIdentity.of(h) for h, _ in self._windows}
         labels: list[str] = []
         self._window_by_label = {}
         seen: dict[str, int] = {}
         for hwnd, title in self._windows:
-            seen[title] = seen.get(title, 0) + 1
-            label = title if seen[title] == 1 else f"{title} ({seen[title]})"
+            ident = self._identity_by_hwnd[hwnd]
+            base = f"{title}   [{ident.process}]" if ident.process else title
+            seen[base] = seen.get(base, 0) + 1
+            label = base if seen[base] == 1 else f"{base} ({seen[base]})"
             labels.append(label)
             self._window_by_label[label] = hwnd
         if not labels:
             labels = ["— окна не найдены —"]
         self.window_menu.configure(values=labels)
-        current = self.window_var.get()
-        wanted = self._settings.get("window_title") if select_saved else current
-        if wanted in self._window_by_label:
-            self.window_var.set(wanted)
-        else:
-            self.window_var.set(labels[0])
-        self._update_window_state()
+
+        wanted: int | None = None
+        identity: WindowIdentity | None = None
+        if self.profile is not None:
+            identity = self.profile.identity
+        elif select_saved:
+            saved = self.library.profiles.get(self._settings.get("last_profile") or "")
+            identity = saved.identity if saved else None
+        if identity is not None:
+            wanted = match_window(identity, list(self._identity_by_hwnd.items()))
+        if wanted is None:
+            current = self._window_by_label.get(self.window_var.get())
+            wanted = current if current in self._identity_by_hwnd else None
+        label = next((lab for lab, h in self._window_by_label.items() if h == wanted), labels[0])
+        self.window_var.set(label)
+        self._on_window_selected()
         self._set_status(f"Найдено окон: {len(self._windows)}")
+
+    def _try_rebind_window(self) -> bool:
+        """После перезапуска программы-цели находит её окно заново по профилю."""
+        if self.profile is None:
+            return False
+        before = self.profile.identity.key
+        self.refresh_windows()
+        hwnd = self.target_hwnd()
+        return bool(hwnd and self.profile is not None and self.profile.identity.key == before and user32.IsWindow(hwnd))
 
     def target_hwnd(self) -> int | None:
         return self._window_by_label.get(self.window_var.get())
 
     def select_window(self, hwnd: int) -> None:
+        if hwnd not in self._identity_by_hwnd:
+            self.refresh_windows()
         for label, h in self._window_by_label.items():
             if h == hwnd:
                 self.window_var.set(label)
-                self._update_window_state()
+                self._on_window_selected()
                 return
-        self.refresh_windows()
-        for label, h in self._window_by_label.items():
-            if h == hwnd:
-                self.window_var.set(label)
-                self._update_window_state()
-                return
+
+    def _on_window_selected(self) -> None:
+        hwnd = self.target_hwnd()
+        if hwnd is None:
+            self._update_window_state()
+            return
+        identity = self._identity_by_hwnd.get(hwnd) or WindowIdentity.of(hwnd)
+        if self.profile is not None and self.profile.identity.key == identity.key:
+            self._update_window_state()
+            return
+        self._commit_current()
+        self.profile = self.library.profile_for(identity)
+        self._ensure_profile_items()
+        self._load_profile()
+        self._update_window_state()
 
     def _update_window_state(self, *_args) -> None:
         hwnd = self.target_hwnd()
         if hwnd is None:
             self.window_state_var.set("")
-            return
-        if not user32.IsWindow(hwnd):
-            self.window_state_var.set("окно закрыто — обновите список")
+        elif not user32.IsWindow(hwnd):
+            self.window_state_var.set("окно закрыто — ждём его появления")
             self.window_state_lbl.configure(text_color=C_ERR)
         elif user32.IsIconic(hwnd):
             self.window_state_var.set("окно свёрнуто — клики могут не обрабатываться")
@@ -901,6 +983,292 @@ class App(ctk.CTk):
             w, h = winapi.client_size(hwnd)
             self.window_state_var.set(f"окно открыто, {w}×{h}")
             self.window_state_lbl.configure(text_color=C_MUTED)
+        if self.profile is not None:
+            p = self.profile
+            self.profile_var.set(
+                f"Профиль: {p.identity.label}  ·  действий: {len(p.action_ids)}, "
+                f"последовательностей: {len(p.sequence_ids)}  ·  узнаётся по процессу и классу окна"
+            )
+        else:
+            self.profile_var.set("")
+
+    # ------------------------------------------------------- профиль
+    def _ensure_profile_items(self) -> None:
+        p = self.profile
+        if p is None:
+            return
+        if not p.action_ids:
+            self.library.add_action(p, NamedAction(name="Действие 1"))
+        if not p.sequence_ids:
+            self.library.add_sequence(p, NamedSequence(name="Последовательность 1"))
+        if p.current_action not in p.action_ids:
+            p.current_action = p.action_ids[0]
+        if p.current_sequence not in p.sequence_ids:
+            p.current_sequence = p.sequence_ids[0]
+
+    def _load_profile(self) -> None:
+        p = self.profile
+        if p is None:
+            return
+        self._loading = True
+        try:
+            self.run_mode_seg.set("Последовательность" if p.run_mode == "sequence" else "Одно действие")
+            self._refresh_action_menu()
+            self._refresh_sequence_menu()
+            self._load_action(self.library.actions.get(p.current_action or ""))
+            self._load_sequence(self.library.sequences.get(p.current_sequence or ""))
+        finally:
+            self._loading = False
+
+    @staticmethod
+    def _labels(items: list) -> tuple[list[str], dict[str, str]]:
+        labels: list[str] = []
+        by_label: dict[str, str] = {}
+        seen: dict[str, int] = {}
+        for item in items:
+            seen[item.name] = seen.get(item.name, 0) + 1
+            label = item.name if seen[item.name] == 1 else f"{item.name} ({seen[item.name]})"
+            labels.append(label)
+            by_label[label] = item.id
+        return labels, by_label
+
+    def _refresh_action_menu(self) -> None:
+        p = self.profile
+        items = [self.library.actions[i] for i in p.action_ids if i in self.library.actions] if p else []
+        labels, self._action_by_label = self._labels(items)
+        self.action_menu.configure(values=labels or ["—"])
+        current = next((lab for lab, i in self._action_by_label.items() if p and i == p.current_action), labels[0] if labels else "—")
+        self.action_var.set(current)
+
+    def _refresh_sequence_menu(self) -> None:
+        p = self.profile
+        items = [self.library.sequences[i] for i in p.sequence_ids if i in self.library.sequences] if p else []
+        labels, self._sequence_by_label = self._labels(items)
+        self.sequence_menu.configure(values=labels or ["—"])
+        current = next((lab for lab, i in self._sequence_by_label.items() if p and i == p.current_sequence), labels[0] if labels else "—")
+        self.sequence_var.set(current)
+
+    def _load_action(self, action: NamedAction | None) -> None:
+        self._current_action = action
+        if action is None:
+            return
+        self._loading = True
+        try:
+            self.action_editor.set_step(action.step)
+            self.interval_min_var.set(f"{action.interval_min:g}")
+            self.interval_max_var.set(f"{action.interval_max:g}")
+            self.count_var.set(str(action.count))
+        finally:
+            self._loading = False
+
+    def _load_sequence(self, seq: NamedSequence | None) -> None:
+        self._current_sequence = seq
+        self._steps = seq.steps if seq is not None else []
+        self.repeat_var.set(str(seq.repeat) if seq is not None else "0")
+        self._refresh_tree()
+
+    def _quiet_step(self) -> bool:
+        e = self.action_editor
+        if e._kind() == KIND_MOUSE and e.pos_mode_var.get() == "fixed":
+            for v in (e.x_var, e.y_var, e.spread_x_var, e.spread_y_var):
+                try:
+                    int(v.get().strip())
+                except ValueError:
+                    return False
+        if e._kind() == KIND_KEY and (e._key is None or (e.key_mode_seg.get() == "Символ" and not e._key.char)):
+            return False
+        if e._kind() == KIND_TEXT and not e.text_var.get():
+            return False
+        return True
+
+    def _commit_current(self) -> None:
+        """Переносит содержимое редакторов в текущие элементы библиотеки (без диалогов)."""
+        if self._loading:
+            return
+        a = self._current_action
+        if a is not None and self._quiet_step():
+            step = self.action_editor.get_step()
+            if step is not None:
+                a.step = step
+            try:
+                a.interval_min = float(self.interval_min_var.get().strip().replace(",", "."))
+                a.interval_max = float(self.interval_max_var.get().strip().replace(",", "."))
+                a.count = int(self.count_var.get().strip())
+            except ValueError:
+                pass
+        s = self._current_sequence
+        if s is not None:
+            s.steps = self._steps
+            try:
+                s.repeat = int(self.repeat_var.get().strip())
+            except ValueError:
+                pass
+        if self.profile is not None:
+            self.profile.run_mode = "sequence" if self.run_mode_seg.get() == "Последовательность" else "single"
+
+    # ------------------------------------------------ действия (библиотека)
+    def _on_action_pick(self) -> None:
+        if self.profile is None:
+            return
+        self._commit_current()
+        action_id = self._action_by_label.get(self.action_var.get())
+        if action_id and action_id in self.library.actions:
+            self.profile.current_action = action_id
+            self._load_action(self.library.actions[action_id])
+            self.save_settings()
+
+    def action_new(self) -> None:
+        if self.profile is None:
+            return
+        name = ask_name(self, "Новое действие", "Название действия:", f"Действие {len(self.profile.action_ids) + 1}")
+        if not name:
+            return
+        self._commit_current()
+        self.library.add_action(self.profile, NamedAction(name=name))
+        self._refresh_action_menu()
+        self._load_action(self.library.actions[self.profile.current_action])
+        self._update_window_state()
+        self.save_settings()
+
+    def action_rename(self) -> None:
+        a = self._current_action
+        if a is None:
+            return
+        name = ask_name(self, "Переименовать", "Новое название:", a.name)
+        if name:
+            a.name = name
+            self._refresh_action_menu()
+            self.save_settings()
+
+    def action_delete(self) -> None:
+        a = self._current_action
+        if a is None or self.profile is None:
+            return
+        others = [w for w in self.library.windows_of_action(a.id) if w != self.profile.identity.label]
+        note = f"\n\nОно также привязано к: {', '.join(others)} — там останется." if others else ""
+        if not messagebox.askyesno("Удалить действие", f"Удалить «{a.name}» для этого окна?{note}"):
+            return
+        self.library.unlink_action(self.profile, a.id)
+        if not self.library.windows_of_action(a.id):
+            self.library.delete_action(a.id)
+        self._current_action = None
+        self._ensure_profile_items()
+        self._refresh_action_menu()
+        self._load_action(self.library.actions.get(self.profile.current_action or ""))
+        self._update_window_state()
+        self.save_settings()
+
+    def action_from_library(self) -> None:
+        if self.profile is None:
+            return
+        items = []
+        for a in self.library.actions.values():
+            if a.id in self.profile.action_ids:
+                continue
+            windows = self.library.windows_of_action(a.id)
+            items.append((a.id, a.name, ", ".join(windows) if windows else "без окна"))
+        if not items:
+            messagebox.showinfo("Действия", "В библиотеке нет действий, не привязанных к этому окну.")
+            return
+        dialog = LibraryPickDialog(self, "Действия других окон", items)
+        self.wait_window(dialog)
+        if dialog.result is None:
+            return
+        self._commit_current()
+        src = self.library.actions[dialog.result[0]]
+        if dialog.result[1] == "copy":
+            item = NamedAction.from_dict(src.to_dict())
+            item.id = NamedAction().id
+            item.name = f"{src.name} (копия)"
+        else:
+            item = src
+        self.library.add_action(self.profile, item)
+        self._refresh_action_menu()
+        self._load_action(item)
+        self._update_window_state()
+        self.save_settings()
+
+    # -------------------------------------- последовательности (библиотека)
+    def _on_sequence_pick(self) -> None:
+        if self.profile is None:
+            return
+        self._commit_current()
+        seq_id = self._sequence_by_label.get(self.sequence_var.get())
+        if seq_id and seq_id in self.library.sequences:
+            self.profile.current_sequence = seq_id
+            self._load_sequence(self.library.sequences[seq_id])
+            self.save_settings()
+
+    def sequence_new(self) -> None:
+        if self.profile is None:
+            return
+        name = ask_name(self, "Новая последовательность", "Название:", f"Последовательность {len(self.profile.sequence_ids) + 1}")
+        if not name:
+            return
+        self._commit_current()
+        self.library.add_sequence(self.profile, NamedSequence(name=name))
+        self._refresh_sequence_menu()
+        self._load_sequence(self.library.sequences[self.profile.current_sequence])
+        self._update_window_state()
+        self.save_settings()
+
+    def sequence_rename(self) -> None:
+        s = self._current_sequence
+        if s is None:
+            return
+        name = ask_name(self, "Переименовать", "Новое название:", s.name)
+        if name:
+            s.name = name
+            self._refresh_sequence_menu()
+            self.save_settings()
+
+    def sequence_delete(self) -> None:
+        s = self._current_sequence
+        if s is None or self.profile is None:
+            return
+        others = [w for w in self.library.windows_of_sequence(s.id) if w != self.profile.identity.label]
+        note = f"\n\nОна также привязана к: {', '.join(others)} — там останется." if others else ""
+        if not messagebox.askyesno("Удалить последовательность", f"Удалить «{s.name}» для этого окна?{note}"):
+            return
+        self.library.unlink_sequence(self.profile, s.id)
+        if not self.library.windows_of_sequence(s.id):
+            self.library.delete_sequence(s.id)
+        self._current_sequence = None
+        self._ensure_profile_items()
+        self._refresh_sequence_menu()
+        self._load_sequence(self.library.sequences.get(self.profile.current_sequence or ""))
+        self._update_window_state()
+        self.save_settings()
+
+    def sequence_from_library(self) -> None:
+        if self.profile is None:
+            return
+        items = []
+        for s in self.library.sequences.values():
+            if s.id in self.profile.sequence_ids:
+                continue
+            windows = self.library.windows_of_sequence(s.id)
+            items.append((s.id, f"{s.name} ({len(s.steps)} шагов)", ", ".join(windows) if windows else "без окна"))
+        if not items:
+            messagebox.showinfo("Последовательности", "В библиотеке нет последовательностей, не привязанных к этому окну.")
+            return
+        dialog = LibraryPickDialog(self, "Последовательности других окон", items)
+        self.wait_window(dialog)
+        if dialog.result is None:
+            return
+        self._commit_current()
+        src = self.library.sequences[dialog.result[0]]
+        if dialog.result[1] == "copy":
+            item = NamedSequence.from_dict(src.to_dict())
+            item.id = NamedSequence(name="").id
+            item.name = f"{src.name} (копия)"
+        else:
+            item = src
+        self.library.add_sequence(self.profile, item)
+        self._refresh_sequence_menu()
+        self._load_sequence(item)
+        self._update_window_state()
+        self.save_settings()
 
     # --------------------------------------------------------- статус
     def _set_status(self, text: str, color: str | None = None) -> None:
@@ -921,16 +1289,18 @@ class App(ctk.CTk):
         return self._runner is not None and self._runner.is_alive()
 
     def toggle_run(self) -> None:
-        if self.running:
+        if self._runner is not None:
             self.stop()
         else:
             self.start()
 
     def _build_run_config(self) -> actions.RunConfig | None:
         hwnd = self.target_hwnd()
+        if (hwnd is None or not user32.IsWindow(hwnd)) and self.profile is not None:
+            self._try_rebind_window()
+            hwnd = self.target_hwnd()
         if hwnd is None or not user32.IsWindow(hwnd):
-            messagebox.showwarning("Окно", "Выберите существующее окно из списка.")
-            self.refresh_windows()
+            messagebox.showwarning("Окно", "Целевое окно не найдено. Запустите программу-цель или выберите другое окно.")
             return None
 
         if self.run_mode_seg.get() == "Последовательность":
@@ -977,8 +1347,6 @@ class App(ctk.CTk):
         )
 
     def start(self) -> None:
-        # _runner обнуляется только в _on_finished, поэтому повторный старт до
-        # обработки завершения невозможен.
         if self._runner is not None or self._updating or self.recorder.active:
             return
         config = self._build_run_config()
@@ -1032,11 +1400,9 @@ class App(ctk.CTk):
             names = ", ".join(f"{HOTKEY_TITLES[n]} ({hk.label})" for n, hk in failed.items())
             self._set_status(f"Не удалось занять сочетания: {names} — они заняты другой программой", C_WARN)
         self._refresh_hotkey_labels()
-        active = [hk.label for hk in self._hotkeys.values() if hk]
-        self.hint_var.set("  ·  ".join(
-            f"{HOTKEY_TITLES[n].split(' ')[0] if n != 'toggle' else 'Старт/Стоп'}: {hk.label}"
-            for n, hk in self._hotkeys.items() if hk
-        ) if active else "Горячие клавиши отключены")
+        short = {"toggle": "Старт/Стоп", "capture": "Координаты", "record": "Запись"}
+        active = [f"{short[n]}: {hk.label}" for n, hk in self._hotkeys.items() if hk]
+        self.hint_var.set("  ·  ".join(active) if active else "Горячие клавиши отключены")
 
     def _refresh_hotkey_labels(self) -> None:
         for name, lbl in self.hotkey_labels.items():
@@ -1104,6 +1470,7 @@ class App(ctk.CTk):
         text = f"Координаты сняты: ({cx}, {cy})" + (f", {pct[0]:.1f}% × {pct[1]:.1f}% окна" if pct else "")
         self._set_status(text, C_RUN)
         self.tray.notify(text)
+        self.save_settings()
 
     # ---------------------------------------------------------- запись
     def toggle_record(self) -> None:
@@ -1113,15 +1480,13 @@ class App(ctk.CTk):
             self._set_state(tray.STATE_IDLE)
             if steps:
                 self._steps.extend(steps)
-                self._refresh_tree()
-                self.tabs.set("Последовательность")
-                self.run_mode_seg.set("Последовательность")
                 self._set_status(f"Запись завершена: добавлено шагов — {len(steps)}", C_RUN)
             else:
                 self._set_status("Запись завершена: действий в целевом окне не было", C_WARN)
+            self._refresh_tree()
             self.save_settings()
             return
-        if self.running:
+        if self._runner is not None:
             return
         hwnd = self.target_hwnd()
         if hwnd is None or not user32.IsWindow(hwnd):
@@ -1131,6 +1496,8 @@ class App(ctk.CTk):
         if not self.recorder.start(hwnd, ignore):
             messagebox.showerror("Запись", "Не удалось установить перехват ввода.")
             return
+        self.tabs.set("Последовательность")
+        self.run_mode_seg.set("Последовательность")
         self.record_btn.configure(text="■ Стоп записи")
         self._set_state(tray.STATE_RECORDING)
         hk = self._hotkeys.get("record")
@@ -1138,13 +1505,28 @@ class App(ctk.CTk):
             "Запись… выполняйте действия в целевом окне" + (f", для остановки нажмите {hk.label}" if hk else ""), C_REC
         )
 
+    def _on_record_event(self) -> None:
+        if not self.recorder.active:
+            return
+        preview = self.recorder.preview()
+        self._refresh_tree(extra=preview)
+        self._set_status(f"Запись… записано шагов: {len(preview)}", C_REC)
+        self.tray.set_state(tray.STATE_RECORDING, f"{len(preview)} шагов")
+
     # ------------------------------------------------ последовательность
-    def _refresh_tree(self) -> None:
+    def _refresh_tree(self, extra: list[Step] | None = None) -> None:
         self.tree.delete(*self.tree.get_children())
         for i, step in enumerate(self._steps, start=1):
             self.tree.insert("", "end", iid=str(i - 1),
                              values=(i, actions.KIND_LABELS.get(step.kind, step.kind), step.describe(), step.delay_text()))
-        self.seq_info_var.set(f"Шагов: {len(self._steps)}")
+        base = len(self._steps)
+        for j, step in enumerate(extra or [], start=1):
+            self.tree.insert("", "end", iid=f"rec{j}", tags=("rec",),
+                             values=(base + j, "● " + actions.KIND_LABELS.get(step.kind, step.kind), step.describe(), step.delay_text()))
+        if extra:
+            self.tree.see(f"rec{len(extra)}")
+        name = f"«{self._current_sequence.name}»  ·  " if self._current_sequence else ""
+        self.seq_info_var.set(f"{name}шагов: {len(self._steps)}" + (f" + записывается {len(extra)}" if extra else ""))
 
     def _selected_index(self) -> int | None:
         sel = self.tree.selection()
@@ -1205,32 +1587,39 @@ class App(ctk.CTk):
         self.save_settings()
 
     def seq_save(self) -> None:
-        path = filedialog.asksaveasfilename(title="Сохранить последовательность", defaultextension=".json",
-                                            filetypes=[("Последовательность", "*.json")])
+        path = filedialog.asksaveasfilename(title="Экспорт последовательности", defaultextension=".json",
+                                            filetypes=[("Последовательность", "*.json")],
+                                            initialfile=(self._current_sequence.name if self._current_sequence else "sequence") + ".json")
         if not path:
             return
         try:
             with open(path, "w", encoding="utf-8") as f:
-                json.dump({"steps": actions.sequence_to_dict(self._steps), "repeat": self.repeat_var.get()},
+                json.dump({"name": self._current_sequence.name if self._current_sequence else "",
+                           "steps": actions.sequence_to_dict(self._steps), "repeat": self.repeat_var.get()},
                           f, ensure_ascii=False, indent=2)
             self._set_status(f"Сохранено: {path}", C_RUN)
         except OSError as exc:
-            messagebox.showerror("Сохранение", str(exc))
+            messagebox.showerror("Экспорт", str(exc))
 
     def seq_load(self) -> None:
-        path = filedialog.askopenfilename(title="Открыть последовательность", filetypes=[("Последовательность", "*.json")])
-        if not path:
+        path = filedialog.askopenfilename(title="Импорт последовательности", filetypes=[("Последовательность", "*.json")])
+        if not path or self.profile is None:
             return
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-            self._steps = actions.sequence_from_dict(data.get("steps"))
-            self.repeat_var.set(str(data.get("repeat", "0")))
-            self._refresh_tree()
+            steps = actions.sequence_from_dict(data.get("steps"))
+            name = str(data.get("name") or Path(path).stem)
+            seq = NamedSequence(name=name, steps=steps, repeat=int(data.get("repeat", 0) or 0))
+            self._commit_current()
+            self.library.add_sequence(self.profile, seq)
+            self._refresh_sequence_menu()
+            self._load_sequence(seq)
+            self._update_window_state()
             self.save_settings()
-            self._set_status(f"Открыто: {path}", C_RUN)
+            self._set_status(f"Импортировано: {name} ({len(steps)} шагов)", C_RUN)
         except (OSError, ValueError, AttributeError) as exc:
-            messagebox.showerror("Открытие", f"Не удалось прочитать файл: {exc}")
+            messagebox.showerror("Импорт", f"Не удалось прочитать файл: {exc}")
 
     # ------------------------------------------------------------ трей
     def _on_unmap(self, event) -> None:
@@ -1245,7 +1634,7 @@ class App(ctk.CTk):
 
     # ------------------------------------------------------- обновление
     def check_updates(self) -> None:
-        if self.running or self._updating:
+        if self._runner is not None or self._updating:
             return
         self._updating = True
         self.update_btn.configure(state="disabled")
@@ -1298,6 +1687,11 @@ class App(ctk.CTk):
     # ----------------------------------------------------------- выход
     def _shutdown(self) -> None:
         self._closing = True
+        for timer_id in self._timers.values():
+            try:
+                self.after_cancel(timer_id)
+            except Exception:  # noqa: BLE001
+                pass
         if self._runner is not None:
             self._runner.stop()
             self._runner.join(timeout=1.5)
