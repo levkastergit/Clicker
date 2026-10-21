@@ -1,12 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_data_files
 
+datas = collect_data_files("customtkinter") + [("assets", "assets")]
 
 a = Analysis(
-    ['clicker.py'],
+    ["clicker.py"],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=[],
+    datas=datas,
+    hiddenimports=["pystray._win32", "PIL.ImageDraw", "PIL.ImageFont"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -22,7 +24,8 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='Автокликер',
+    name="Автокликер",
+    icon="assets/icon.ico",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -1,2 +1,6 @@
-# Стандартная библиотека Python достаточна (tkinter + ctypes).
-# Дополнительные пакеты не требуются.
+customtkinter>=5.2
+pystray>=0.19
+Pillow>=9.5
+
+# Для сборки exe:
+# pyinstaller>=6.0
